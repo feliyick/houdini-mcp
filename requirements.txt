@@ -1,0 +1,4 @@
+mcp[cli]>=1.2,<2    # v1 API (FastMCP); v2 renamed it
+numpy
+pillow
+OpenEXR>=3.3

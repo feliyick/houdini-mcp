@@ -39,7 +39,7 @@ DEFAULT_CONFIG = {
     "front_axis": [0, 0, 1]                         # frame_camera: direction the facades face (camera stands out along this)
 }
 # commands that change the scene (auto_save runs after these when they succeed and weren't a dry run)
-WRITE_CMDS = {'set_parms', 'create_node', 'connect', 'set_look', 'run_python', 'undo', 'redo', 'frame_camera'}
+WRITE_CMDS = {'set_parms', 'create_node', 'connect', 'set_look', 'run_python', 'undo', 'redo', 'frame_camera', 'revert_hda'}
 CONFIG = dict(DEFAULT_CONFIG)
 
 def load_config():
@@ -153,6 +153,9 @@ def cmd_list_nodes(path='/obj', recursive=False, limit=300):
         if any(ins): e['inputs'] = ins                      # wiring, so the agent can follow the graph
         try:
             if n.isDisplayFlagSet(): e['display'] = True
+        except AttributeError: pass
+        try:
+            if n.isBypassed(): e['bypassed'] = True
         except AttributeError: pass
         out.append(e)
     return {'count': len(nodes), 'nodes': out}
@@ -355,34 +358,40 @@ def _first_hit(geos, orig, d, max_dist):
             if best is None or dist < best: best = dist
     return best
 
-def _near_clip(eye, targets, d, bb=None):
-    """Find occluders between camera and target. Walks each ray all the way to the target (the first hit inside the
-    target's bbox), so long lenses that stand far back are handled too. Returns (near_clip or None, notes); the
-    clip goes in the open gap between the last occluder and the target, never inside an occluder."""
+def _near_clip(eye, targets, d, bb=None, fwd=None):
+    """Find what stands between camera and target and place the near clip MID-ROAD: in the middle of the widest open
+    gap along the view axis, so it never slices an occluder and never shaves the subject (bays and stoops that stick
+    out further on other seeds stay whole). Depths are measured along the camera axis, like the clip plane itself.
+    Returns (near_clip or None, notes)."""
     geos = [hou.node(p).geometry() for p in CONFIG['occluder_sops'] if hou.node(p) and hou.node(p).geometry()]
     if not geos: return None, ['no occluder_sops configured: line of sight not checked']
+    fwd = (fwd or (targets[0] - eye)).normalized()
     def in_target(pt):
         if bb is None: return False
         mn, mx = bb.minvec(), bb.maxvec(); e = 0.05
         return all(mn[i] - e <= pt[i] <= mx[i] + e for i in range(3))
-    last_occ, first_tgt = 0.0, None
+    occ, tgt = [], None
     for t in targets:
         dirv = (t - eye); dist = dirv.length(); dirv = dirv.normalized()
-        travelled = 0.0
+        cosf = max(1e-3, dirv.dot(fwd)); travelled = 0.0
         for _ in range(200):
-            o = eye + dirv * travelled
-            h = _first_hit(geos, o, dirv, dist + 1.0 - travelled)
+            h = _first_hit(geos, eye + dirv * travelled, dirv, dist + 1.0 - travelled)
             if h is None: break
             travelled += h
+            depth = travelled * cosf
             if in_target(eye + dirv * travelled):
-                first_tgt = travelled if first_tgt is None else min(first_tgt, travelled); break
-            last_occ = max(last_occ, travelled); travelled += 0.02
-    if last_occ <= 0: return None, ['line of sight clear']
-    gap_end = first_tgt if first_tgt is not None else d
-    if gap_end - last_occ < 0.2:
-        return last_occ + 0.1, ['occluder within 0.2 m of the target (%.1f m): near clip set right behind it; consider another angle' % last_occ]
-    near = last_occ + min(1.0, (gap_end - last_occ) * 0.5)
-    return near, ['geometry between camera and target up to %.1f m: near clip set to %.1f m, in the open gap before the target (%.1f m)' % (last_occ, near, gap_end)]
+                tgt = depth if tgt is None else min(tgt, depth); break
+            occ.append(depth); travelled += 0.02
+    if not occ: return None, ['line of sight clear']
+    end = tgt if tgt is not None else d
+    pts = sorted(x for x in occ if x < end) + [end]
+    gaps = [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+    a, b = max(gaps, key=lambda g: g[1] - g[0]) if gaps else (pts[0], end)
+    if b - a < 0.4:
+        return a + 0.1, ['no clear gap in front of the target (occluders up to %.1f m): clip right behind them; consider another angle' % a]
+    near = (a + b) * 0.5
+    return near, ['geometry between camera and target: near clip %.1f m, mid-way through the widest open gap '
+                  '(%.1f-%.1f m; the subject starts at %.1f m)' % (near, a, b, end)]
 
 def cmd_frame_camera(name, target, view='front', width=1280, height=720, margin=0.08, eye_height=1.6,
                      distance=None, lens_mm=None, yaw_deg=35.0, elevation_deg=12.0, ground_y=None, dry_run=False):
@@ -429,7 +438,9 @@ def cmd_frame_camera(name, target, view='front', width=1280, height=720, margin=
         shift = 0.0; aim = [c]
         notes.append('angle view: verticals will converge (tilted camera); use view="front" for straight walls')
     corners = [hou.Vector3(x, y, z) for x in (mn[0], mx[0]) for y in (mn[1], mx[1]) for z in (mn[2], mx[2])]
-    near, n2 = _near_clip(eye, aim + corners, (c - eye).length(), bb); notes += n2
+    fwd = (-ax if view == 'front' else (c - eye))
+    face_pts = [hou.Vector3(x, y, z) for x in (mn[0], c[0], mx[0]) for y in (mn[1], c[1], mx[1]) for z in (mn[2], mx[2])]
+    near, n2 = _near_clip(eye, aim + face_pts, (c - eye).length(), bb, fwd); notes += n2
     plan = {'camera': '/cameras/' + name, 'position': list(eye), 'rotate': [pitch, yaw, 0], 'focal_mm': round(f, 2),
             'aperture_mm': [_HAP, round(vap, 3)], 'aspect': [width, height], 'vertical_shift_mm': round(shift, 3),
             'near_clip': near, 'distance_m': round(distance, 2), 'target_size_m': [round(W, 2), round(H, 2)], 'notes': notes,
@@ -500,9 +511,23 @@ def _viewport_state(vp):
     scheme = None
     try: scheme = vp.settings().colorScheme()
     except Exception: pass
-    return {'cam': cam, 'view': vp.defaultCamera().stash(), 'shade': shade, 'scheme': scheme}
+    vtype = None
+    try: vtype = vp.type()
+    except Exception: pass
+    grid = {}
+    for g in ('displayOrthoGrid', 'displayReferencePlane'):
+        try: grid[g] = getattr(vp.settings(), g)()
+        except Exception: pass
+    return {'grid': grid, 'cam': cam, 'view': vp.defaultCamera().stash(), 'shade': shade, 'scheme': scheme, 'vtype': vtype}
 
 def _put_viewport_state(vp, st):
+    for g, v in st.get('grid', {}).items():
+        try: getattr(vp.settings(), 'set' + g[0].upper() + g[1:])(v)
+        except Exception: pass
+    if st.get('vtype') is not None:
+        try:
+            if vp.type() != st['vtype']: vp.changeType(st['vtype'])
+        except Exception: pass
     if st.get('scheme') is not None:
         try: vp.settings().setColorScheme(st['scheme'])
         except Exception: pass
@@ -522,17 +547,157 @@ def _set_background(vp, background):
     if background not in schemes: raise ValueError('background must be light, grey or dark')
     vp.settings().setColorScheme(schemes[background])
 
+def _label_visualizer(attrib, cls='point', vp=None):
+    """Temporary viewport visualizer that writes an attribute's value as text next to each element.
+    Returns a function that removes it."""
+    vv = hou.viewportVisualizers
+    vis = vv.createVisualizer(vv.type('vis_marker'), hou.viewportVisualizerCategory.Scene)
+    try: vis.setName('mcp_labels')
+    except Exception: pass
+    names = {pt.name() for pt in vis.parmTemplateGroup().parmTemplates()} if hasattr(vis, 'parmTemplateGroup') else set()
+    def put(nm, v):
+        try: vis.setParm(nm, v)
+        except Exception: pass
+    put('attrib', attrib)
+    put('class', {'point': 0, 'vertex': 1, 'prim': 2, 'primitive': 2, 'detail': 3}.get(cls, 0))
+    put('style', 'text'); put('style', 0)
+    vis.setIsActive(True, vp)
+    def gone():
+        try: vis.destroy()
+        except Exception: pass
+    return gone
+
+_VIEWS = None
+def _set_view(vp, view):
+    """front | back | left | right | top | bottom | persp (orthographic views read best for diagrams)."""
+    if not view: return
+    t = hou.geometryViewportType
+    m = {'front': t.Front, 'back': t.Back, 'left': t.Left, 'right': t.Right, 'top': t.Top, 'bottom': t.Bottom,
+         'persp': t.Perspective, 'perspective': t.Perspective}
+    if view not in m: raise ValueError('view must be one of %s' % sorted(m))
+    vp.changeType(m[view])
+
+def _hide_grids(vp, sv):
+    for g in ('setDisplayOrthoGrid', 'setDisplayReferencePlane'):
+        try: getattr(vp.settings(), g)(False)
+        except Exception: pass
+    try: sv.referencePlane().setIsVisible(False)
+    except Exception: pass
+
+def _also_set(values):
+    """Temporarily set other parameters {parm_path: value}. Returns a restore function."""
+    done = []
+    with hou.undos.disabler():
+        for path, v in (values or {}).items():
+            q = hou.parm(path)
+            if q is None: raise ValueError('no parm %s' % path)
+            _writable(q.node().path()); done.append((q, _snapshot(q)))
+            q.deleteAllKeyframes(); q.set(v)
+    def back():
+        with hou.undos.disabler():
+            for q, sn in reversed(done):
+                try: _restore(q, sn)
+                except Exception: pass
+    return back
+
+def _tint(colours):
+    """Temporarily colour nodes' output {node_path: [r, g, b]} with a Color SOP placed after each (deleted afterwards).
+    Returns (mapping node_path -> temp colour node path, restore function)."""
+    made, mapping = [], {}
+    with hou.undos.disabler():
+        for path, rgb in (colours or {}).items():
+            n = _node(path); par = n.parent(); _writable(par.path())
+            c = par.createNode('color', 'mcp_temp_tint')
+            c.setInput(0, n)
+            try: c.parmTuple('color').set(tuple(float(x) for x in rgb))
+            except Exception: pass
+            made.append(c); mapping[path] = c.path()
+    def back():
+        with hou.undos.disabler():
+            for c in made:
+                try: c.destroy()
+                except Exception: pass
+    return mapping, back
+
+def _template(paths):
+    """Temporarily set template flags (shown as a grey ghost behind the display). Returns a restore function."""
+    done = []
+    with hou.undos.disabler():
+        for p in paths:
+            n = _node(p)
+            if not n.isTemplateFlagSet(): n.setTemplateFlag(True); done.append(p)
+    def back():
+        with hou.undos.disabler():
+            for p in done:
+                n = hou.node(p)
+                if n is not None:
+                    try: n.setTemplateFlag(False)
+                    except Exception: pass
+    return back
+
 def _frame(vp, display=None):
     """Frame the shown node's bounding box if one was given (frameAll would also fit ground planes, skies...)."""
     if display:
         try:
+            if isinstance(display, (list, tuple)):
+                bb = None
+                for d in display:
+                    b = _node(d).geometry().boundingBox()
+                    if bb is None: bb = b
+                    else: bb.enlargeToContain(b)
+                vp.frameBoundingBox(bb); return
             g = _node(display).geometry()
             if g is not None: vp.frameBoundingBox(g.boundingBox()); return
         except Exception: pass
     vp.frameAll()
 
+def _peek_list(unbypass, display, tint):
+    """Nodes whose containing locked HDA must be opened for this capture: bypassed nodes to switch on, plus anything a
+    temporary merge (display list) or tint has to be built next to."""
+    out = list(unbypass or [])
+    if isinstance(display, (list, tuple)): out += list(display)
+    out += list((tint or {}).keys())
+    return out
+
+def _peek(unbypass, flip=None):
+    """Temporarily switch bypassed nodes back on, e.g. a retired debug/blockout chain, even inside a locked HDA:
+    the instance is unlocked, edited, and afterwards re-matched to its HDA definition (exactly as before). Refuses
+    if that instance already has local edits, so nothing of the artist's can be lost. Returns a restore function."""
+    assets, flipped = [], []
+    with hou.undos.disabler():
+        for path in unbypass:
+            n = _node(path); _writable(n.path())
+            a = n.parent()
+            while a is not None and a.type().definition() is None: a = a.parent()
+            if a is not None and a not in assets:
+                if not a.isLockedHDA():
+                    raise PermissionError('%s is an unlocked HDA instance (local edits); not touching it' % a.path())
+                a.allowEditingOfContents(); assets.append(a)
+            n = _node(path)
+            if (flip is None or path in flip) and n.isBypassed(): n.bypass(False); flipped.append(path)
+    def back():
+        with hou.undos.disabler():
+            for a in assets:
+                try: a.matchCurrentDefinition()              # relock: contents exactly as the definition
+                except Exception: pass
+            for path in flipped:                              # nodes outside any HDA: flip back by hand
+                n = hou.node(path)
+                if n is not None and n.parent().type().definition() is None and not n.isInsideLockedHDA():
+                    try: n.bypass(True)
+                    except Exception: pass
+    return back
+
 def _show(path):
-    """Temporarily move the display flag to `path` (outside the undo history). Returns a function that puts it back."""
+    """Temporarily move the display flag to `path` (outside the undo history). Returns a function that puts it back.
+    A list of nodes is merged by a temporary Merge SOP (deleted afterwards) and that is displayed."""
+    temp = None
+    if isinstance(path, (list, tuple)):
+        nodes = [_node(p) for p in path]
+        par = nodes[0].parent(); _writable(par.path())
+        with hou.undos.disabler():
+            temp = par.createNode('merge', 'mcp_temp_show')
+            for i, n in enumerate(nodes): temp.setInput(i, n)
+        path = temp.path()
     n = _node(path)
     sibs = [c for c in n.parent().children() if hasattr(c, 'isDisplayFlagSet')]
     was = [c for c in sibs if c.isDisplayFlagSet()]
@@ -540,10 +705,15 @@ def _show(path):
     def back():
         with hou.undos.disabler():
             for c in was: c.setDisplayFlag(True)
+            if temp is not None:
+                try: temp.destroy()
+                except Exception: pass
     return back
 
 def cmd_viewport_snapshot(width=800, height=450, network=None, camera=None, frame_all=False, shading=None,
-                          frames=None, step=1, renderer='Houdini GL', limit=48, display=None, background=None):
+                          frames=None, step=1, renderer='Houdini GL', limit=48, display=None, background=None,
+                          label_attrib=None, label_class='point', unbypass=None, view=None, template=None,
+                          template_shading='wire', grid=False, also_set=None, tint=None):
     """Capture the Scene Viewer with a flipbook (OpenGL, fast). Works in /obj and /stage.
     frames=[start, end] captures a range (playback). Everything changed for the capture (network, camera, view,
     shading, renderer, frame) is put back afterwards; the artist's viewport is left as it was."""
@@ -564,8 +734,16 @@ def cmd_viewport_snapshot(width=800, height=450, network=None, camera=None, fram
     pwd_before = sv.pwd()
     home = _viewport_state(sv.curViewport())
     renderer_before = None
-    unshow = _show(display) if display else None
+    unpeek = unshow = untemplate = unlabel = unset = untint = None
     try:
+        pl = _peek_list(unbypass, display, tint)
+        unpeek = _peek(pl, flip=set(unbypass or [])) if pl else None
+        unset = _also_set(also_set) if also_set else None
+        tmap, untint = _tint(tint) if tint else ({}, None)
+        if display and tmap:
+            display = [tmap.get(d, d) for d in display] if isinstance(display, (list, tuple)) else tmap.get(display, display)
+        unshow = _show(display) if display else None
+        untemplate = _template(template) if template else None
         switched = bool(network) and _node(network) != pwd_before
         if switched: sv.setPwd(_node(network))
         vp = sv.curViewport()
@@ -573,6 +751,7 @@ def cmd_viewport_snapshot(width=800, height=450, network=None, camera=None, fram
         is_lop = False
         try: is_lop = sv.pwd().childTypeCategory() == hou.lopNodeTypeCategory()
         except Exception: pass
+        unlabel = _label_visualizer(label_attrib, label_class, vp) if label_attrib else None
         if renderer and is_lop and hasattr(sv, 'currentHydraRenderer'):   # Hydra renderers only exist in Solaris
             try:
                 cur = sv.currentHydraRenderer()
@@ -580,14 +759,19 @@ def cmd_viewport_snapshot(width=800, height=450, network=None, camera=None, fram
             except Exception: pass
         if camera:
             vp.setCamera(hou.node(camera) if camera.startswith('/obj/') else camera)
+        _set_view(vp, view)
         if frame_all:
             if camera: vp.useDefaultCamera()
             _frame(vp, display)
+        if not grid: _hide_grids(vp, sv)
         _set_background(vp, background)
         if shading:
             for ds, _ in target['shade']:
                 try: vp.settings().displaySet(ds).setShadedMode(_shading_modes()[shading])
                 except Exception: pass
+        if template and template_shading:
+            try: vp.settings().displaySet(hou.displaySetType.TemplateModel).setShadedMode(_shading_modes()[template_shading])
+            except Exception: pass
         fb = sv.flipbookSettings().stash()              # a copy: the artist's flipbook settings are untouched
         fb.outputToMPlay(False)
         fb.frameRange((f0, f1)); fb.frameIncrement(step)
@@ -607,7 +791,10 @@ def cmd_viewport_snapshot(width=800, height=450, network=None, camera=None, fram
         except Exception: pass
         try: _put_viewport_state(sv.curViewport(), home)
         except Exception: pass
-        if unshow: unshow()
+        for fn in (unlabel, untemplate, unshow, untint, unset, unpeek):
+            if fn:
+                try: fn()
+                except Exception: pass
         hou.setFrame(frame_before)
     shots = []
     f = f0
@@ -619,7 +806,8 @@ def cmd_viewport_snapshot(width=800, height=450, network=None, camera=None, fram
     return {'images': shots, 'seconds': round(time.time() - t, 2), 'network': (network or sv.pwd().path())}
 
 def cmd_parm_sweep(node, parm, values, width=800, height=450, network=None, camera=None, frame_all=True,
-                   shading=None, renderer='Houdini GL', display=None, also_set=None, samples=24, background=None):
+                   shading=None, renderer='Houdini GL', display=None, also_set=None, samples=24, background=None,
+                   unbypass=None, view=None, template=None, tint=None):
     """Step one parameter through `values`, capturing the viewport at each (for sweep videos / GIFs).
     Framing is held fixed: with frame_all, the view is framed once on the LAST value (usually the biggest).
     also_set={parm_path: value} sets other parameters for the duration (e.g. a mode toggle).
@@ -632,17 +820,19 @@ def cmd_parm_sweep(node, parm, values, width=800, height=450, network=None, came
     sv = hou.ui.paneTabOfType(hou.paneTabType.SceneViewer)
     if sv is None: raise ValueError('no Scene Viewer pane is open')
     snap = _snapshot(p)
-    extra = []
-    for path, v in (also_set or {}).items():
-        q = hou.parm(path)
-        if q is None: raise ValueError('no parm %s' % path)
-        _writable(q.node().path()); extra.append((q, _snapshot(q), v))
     pwd_before = sv.pwd(); home = _viewport_state(sv.curViewport()); target = None
     shots = []
-    unshow = _show(display) if display else None
+    unpeek = unshow = untemplate = unset = untint = None
     try:
+        pl = _peek_list(unbypass, display, tint)
+        unpeek = _peek(pl, flip=set(unbypass or [])) if pl else None
+        unset = _also_set(also_set) if also_set else None
+        tmap, untint = _tint(tint) if tint else ({}, None)
+        if display and tmap:
+            display = [tmap.get(d, d) for d in display] if isinstance(display, (list, tuple)) else tmap.get(display, display)
+        unshow = _show(display) if display else None
+        untemplate = _template(template) if template else None
         with hou.undos.disabler():
-            for q, _, v in extra: q.deleteAllKeyframes(); q.set(v)
             if network and _node(network) != pwd_before:
                 sv.setPwd(_node(network)); target = _viewport_state(sv.curViewport())
             vp = sv.curViewport()
@@ -652,12 +842,20 @@ def cmd_parm_sweep(node, parm, values, width=800, height=450, network=None, came
                 vp.setCamera(hou.node(camera) if camera.startswith('/obj/') else camera)
             elif frame_all:
                 p.deleteAllKeyframes(); p.set(values[-1])
-                vp.useDefaultCamera(); _frame(vp, display)
+                vp.useDefaultCamera(); _set_view(vp, view); _frame(vp, display)
             karma = (renderer or '').lower() == 'karma'
             if karma and not camera: raise ValueError("renderer='karma' needs a camera")
             for v in values:
                 p.deleteAllKeyframes(); p.set(v)
-                lab = '%s = %s' % (p.parmTemplate().label(), v)
+                shown = v
+                try:                                     # menus: show the item's label ("Queen Anne", not 2)
+                    items, labels = p.menuItems(), p.menuLabels()
+                    if items:
+                        cur = p.evalAsString()
+                        if cur in items: shown = labels[items.index(cur)]
+                        elif isinstance(v, int) and 0 <= v < len(labels): shown = labels[v]
+                except Exception: pass
+                lab = '%s = %s' % (p.parmTemplate().label(), shown)
                 if karma:
                     r = cmd_quick_render(camera, width=width, height=height, samples=samples)
                     shots.append({'exr': r['exr'], 'frame': len(shots) + 1, 'label': lab})
@@ -667,14 +865,27 @@ def cmd_parm_sweep(node, parm, values, width=800, height=450, network=None, came
     finally:
         with hou.undos.disabler():
             _restore(p, snap)
-            for q, sn, _ in extra: _restore(q, sn)
             try:
                 if target is not None: _put_viewport_state(sv.curViewport(), target)
                 if sv.pwd() != pwd_before: sv.setPwd(pwd_before)
                 _put_viewport_state(sv.curViewport(), home)
             except Exception: pass
-        if unshow: unshow()
+        for fn in (untemplate, unshow, untint, unset, unpeek):
+            if fn:
+                try: fn()
+                except Exception: pass
     return {'images': shots}
+
+def cmd_revert_hda(node, dry_run=False):
+    """Re-match an HDA instance to its saved definition (discards that instance's local edits: unlocked contents,
+    flipped flags, temporary nodes). Backed up first."""
+    n = _node(node); _writable(n.path())
+    if n.type().definition() is None: raise ValueError('%s is not an HDA instance' % node)
+    if dry_run: return {'dry_run': True, 'would_revert': n.path(), 'currently_locked': n.isLockedHDA()}
+    backup = _backup()
+    with hou.undos.group('MCP: revert_hda %s' % n.name()):
+        n.matchCurrentDefinition()
+    return {'reverted': n.path(), 'locked': n.isLockedHDA(), 'backup': backup}
 
 def cmd_reload_listener():
     """Reload this module from disk and restart the listener, so code changes apply without the artist

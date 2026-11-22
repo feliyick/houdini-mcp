@@ -115,6 +115,11 @@ def restore_backup(name: str, dry_run: bool = False) -> dict:
     return _call('restore_backup', timeout=600, name=name, dry_run=dry_run)
 
 @mcp.tool()
+def revert_hda(node: str, dry_run: bool = False) -> dict:
+    """Re-match an HDA instance to its saved definition (relocks it; discards that instance's local edits). Backed up first."""
+    return _call('revert_hda', node=node, dry_run=dry_run)
+
+@mcp.tool()
 def reload_listener() -> dict:
     """Reload the listener's code inside Houdini (after editing houdini_listener.py). Needs "allow_reload": true
     in the project config. Waits until the new listener answers."""
@@ -150,19 +155,29 @@ def quick_render(camera: str, width: int = 640, height: int | None = None, sampl
 def viewport_snapshot(width: int = 800, height: int = 450, network: str | None = None, camera: str | None = None,
                       frame_all: bool = False, shading: str | None = None, frames: list[float] | None = None,
                       step: int = 1, renderer: str = 'Houdini GL', save_to: str | None = None,
-                      display: str | None = None, background: str | None = None) -> Image:
+                      display: str | list[str] | None = None, background: str | None = None,
+                      label_attrib: str | None = None, label_class: str = 'point',
+                      unbypass: list[str] | None = None, view: str | None = None,
+                      template: list[str] | None = None, template_shading: str = 'wire',
+                      grid: bool = False, also_set: dict | None = None, tint: dict | None = None) -> Image:
     """Capture the Scene Viewer (fast OpenGL flipbook) and return it as an image. Works for /obj and /stage.
     network: show this network instead of the current one (e.g. '/obj' or '/stage').
     camera: look through a camera (/obj node path, or a USD prim path in /stage). frame_all: fit everything in view.
-    shading: smooth | flat | wire | wire_shaded | hidden_line. display: temporarily show this node (moves the display flag, restored after).
+    shading: smooth | flat | wire | wire_shaded | hidden_line. display: temporarily show this node, or a list of nodes merged together (display flag restored after).
     background: light | grey | dark viewport background for the capture.
+    view: front | back | left | right | top | bottom | persp. template: nodes shown as a ghost behind (drawn in template_shading, default wire). grid: show viewport grids (default off). also_set={parm_path: value}: set for the capture only.
+    tint={node_path: [r,g,b]}: colour that node's output for the capture (temporary Color SOP; use with display).
+    unbypass: switch these bypassed nodes on for the capture (works inside a locked HDA; restored exactly after).
+    label_attrib: (experimental, may not draw) write an attribute's value as text on each point/prim (label_class).
     frames: [start, end] to capture a frame range (playback); returned as one labelled contact sheet.
     The artist's viewport (view, camera, shading, network, renderer, frame) is restored afterwards.
     Captures are temporary (deleted once returned, like a browser-automation screenshot); pass save_to
     (a .png path) to keep one."""
     res = _call('viewport_snapshot', timeout=600, width=width, height=height, network=network, camera=camera,
                 frame_all=frame_all, shading=shading, frames=frames, step=step, renderer=renderer, display=display,
-                background=background)
+                background=background, label_attrib=label_attrib, label_class=label_class,
+                unbypass=unbypass, view=view, template=template,
+                template_shading=template_shading, grid=grid, also_set=also_set, tint=tint)
     shots = res['images']
     try:
         png = open(shots[0]['png'], 'rb').read() if len(shots) == 1 else _contact_sheet(shots)
@@ -229,7 +244,8 @@ def sweep_video(save_to: str, node: str, parm: str, values: list | None = None, 
                 width: int = 960, height: int = 540, network: str | None = None, camera: str | None = None,
                 frame_all: bool = True, shading: str | None = None, renderer: str = 'Houdini GL',
                 display: str | None = None, also_set: dict | None = None, samples: int = 24,
-                background: str | None = None) -> list:
+                background: str | None = None, unbypass: list[str] | None = None, view: str | None = None,
+                template: list[str] | None = None, tint: dict | None = None) -> list:
     """Video of a parameter changing (e.g. row count 1..7, seed sweep): steps node.parm through `values`
     (or `count` evenly spaced values from start to end), captures the viewport at each, and saves an .mp4 or .gif.
     Framing is held fixed (frame_all frames once on the last value). The parameter is restored afterwards.
@@ -245,7 +261,8 @@ def sweep_video(save_to: str, node: str, parm: str, values: list | None = None, 
             values = [round(v, 4) for v in values]
     res = _call('parm_sweep', timeout=7200, node=node, parm=parm, values=values, width=width, height=height,
                 network=network, camera=camera, frame_all=frame_all, shading=shading, renderer=renderer,
-                display=display, also_set=also_set, samples=samples, background=background)
+                display=display, also_set=also_set, samples=samples, background=background,
+                unbypass=unbypass, view=view, template=template, tint=tint)
     for sh in res['images']:                       # Karma frames come back as EXR: convert to PNG once
         if 'exr' in sh:
             png = sh['exr'][:-4] + '.png'

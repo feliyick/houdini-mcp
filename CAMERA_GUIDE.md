@@ -7,9 +7,10 @@ Use the `frame_camera` tool. It encodes most of this. Then verify with `quick_re
   rows get longer), and hard-coded cameras end up inside walls.
 - **Re-check old cameras after scene changes.** A camera that was fine yesterday can be inside a new
   building today. A black or one-colour preview almost always means the camera is inside geometry.
-- **Clip occluders with the near plane, in open space.** To stand far enough back for a face-on shot you
-  may need to stand inside the building opposite. Put the near clip just past the occluder, mid-road,
-  never slicing through a tree or lamp (that leaves dark blobs). `frame_camera` ray-tests and does this.
+- **Clip occluders with the near plane, mid-road.** To stand far enough back for a face-on shot you may need to
+  stand inside the building opposite. `frame_camera` puts the near clip in the middle of the widest open gap between
+  camera and subject (usually the road): never right in front of the subject, where a seed with deeper bays or a
+  bigger stoop gets sliced, and never through a tree or lamp (that leaves dark blobs).
 - **Long lenses at eye level see foreground clutter** (trees, parked cars). Raise the camera above it
   (an upstairs window: 4–8 m) rather than zooming more.
 
@@ -30,6 +31,14 @@ Use the `frame_camera` tool. It encodes most of this. Then verify with `quick_re
 - **The Karma viewport frames to the render resolution.** To preview a non-16:9 camera there, the render
   resolution must match.
 - Hide other cameras' guides in viewport captures.
+
+## Sweeps (a parameter changing under a fixed camera)
+- **Set the near clip for the worst case, not the framing case.** When the layout changes during a sweep (row count,
+  seed), things in front of the subject move too. A clip placed for 7 houses sliced the houses across the street
+  at 1 house, leaving black slabs. Probe each extreme with `frame_camera(dry_run=True)` and use the clip that is
+  clear for all of them, just in front of the subject's nearest part (stoops).
+- Turn off filler that only exists to pad the frame (e.g. street extends) when it would move through the clip.
+- Check the extremes with a 2-frame, low-res Karma sweep before committing to the full render.
 
 ## Composition
 - Orbit first, compute second: the artist's favourite angles came from looking around. When Felicity finds

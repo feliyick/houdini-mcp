@@ -37,6 +37,19 @@ project; its settings live in one config file (`examples/sf_victorian_house.json
   returns a labelled contact sheet, so the agent can check playback. Your viewport is put back exactly as it was.
 - `quick_render`: a small Karma render through any camera, returned to the agent as an image.
 
+**Make videos and GIFs** (`.mp4` or `.gif`, saved where you say)
+- `viewport_video`: flipbook a frame range from the viewport (playback, turntables).
+- `sweep_video`: a parameter changing over time, e.g. row count 1 → 7 or a seed sweep, labelled
+  "Row Count = 3" on each frame. Framing is held fixed; `display` shows a chosen node, `also_set` flips other
+  parameters for the duration (a mode toggle, a lighting look), and everything is restored afterwards.
+  `renderer='karma'` renders each step in Karma through a camera for final-quality sweeps.
+
+**Cameras** (read the `houdini://camera-guide` resource first)
+- `frame_camera`: create or update a camera that frames a target by its bounding box. Front view keeps the camera
+  level and shifts the lens so walls stay vertical; angle view gives a three-quarter shot. Sets the aspect ratio to
+  the frame size, ray-tests the line of sight and puts the near clip in open space past anything in the way.
+- `look_through`: point your viewport at a camera.
+
 **Change a scene** (every edit has a `dry_run` mode that reports what *would* change)
 - `set_parms`: values or expressions (`"=ch('../seed') * 2"`), including your VEX snippets.
 - `create_node`, `connect`: build and wire networks.
@@ -116,7 +129,9 @@ Start `claude` in your project folder (restart it if it was already running, so 
 - *"Undo that last change."*
 - *"Take a viewport snapshot of /obj in wireframe, framed on everything."*
 - *"Flipbook frames 1 to 24 every 4 frames and tell me if anything pops."*
-- *"quick_render through /cameras/camera1 at 640x360."* (needs a Solaris stage with a camera and a Karma LOP)
+- *"quick_render through /cameras/camera1 at 640x360."*
+- *"Make a GIF of the seed going from 1 to 12 on my asset, framed on its output node."*
+- *"frame_camera a front view of /obj/geo1/OUT as a 720x960 portrait, then quick_render it."* (needs a Solaris stage with a camera and a Karma LOP)
 - *"What's the history? Restore the backup from before the bevel."*
 
 ### Other MCP clients
@@ -136,6 +151,9 @@ Put a `houdini_mcp_config.json` next to your `.hip`. Every key is optional:
 |---|---|---|
 | `allowed_roots` | `["/obj", "/stage", "/out"]` | the only places the agent may edit |
 | `allow_python` | `false` | enable `run_python` |
+| `camera_insert_before` | the Karma LOP | `frame_camera` wires new camera LOPs in above this node |
+| `occluder_sops` | `[]` | SOPs `frame_camera` ray-tests for things between camera and target |
+| `front_axis` | `[0, 0, 1]` | the direction facades face (front-view cameras stand out along it) |
 | `allow_reload` | `false` | enable `reload_listener` (pick up edited listener code without re-running `start_listener.py`) |
 | `auto_save` | `false` | save the `.hip` after every successful agent edit (backup first). Note this also saves any unsaved hand edits. |
 | `check_nodes` | displayed `/obj` nodes | what `cook_and_check` cooks by default |
@@ -173,6 +191,7 @@ See `examples/sf_victorian_house.json` for a full one.
 | `houdini_listener.py` | runs inside Houdini: the commands and guardrails |
 | `start_listener.py` | paste/shelf snippet that (re)starts the listener |
 | `test_connection.py` | terminal check that the listener answers |
+| `CAMERA_GUIDE.md` | camera rules, served to the agent as `houdini://camera-guide` |
 | `examples/` | project configs |
 
 ## Licence

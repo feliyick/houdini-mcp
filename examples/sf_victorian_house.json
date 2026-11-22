@@ -55,6 +55,15 @@
       "/obj/sf_house_geometry/STREET_CONTROLS/clouds": 1
     }
   },
+  "camera_insert_before": "/stage/sfh_shot_cam",
+  "occluder_sops": [
+    "/obj/sf_house_geometry/OUT_STREET"
+  ],
+  "front_axis": [
+    0,
+    0,
+    1
+  ],
   "auto_save": true,
   "allow_reload": true
 }

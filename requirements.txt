@@ -2,3 +2,4 @@ mcp[cli]>=1.2,<2    # v1 API (FastMCP); v2 renamed it
 numpy
 pillow
 OpenEXR>=3.3
+imageio-ffmpeg>=0.5   # mp4 encoding for viewport_video / sweep_video (bundles ffmpeg)

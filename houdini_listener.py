@@ -15,7 +15,7 @@ Guardrails:
   * run_python is OFF unless the config turns it on
   * every call is appended to $HIP/mcp/audit.log
 """
-import json, os, socket, sys, tempfile, threading, time, traceback
+import json, math, os, socket, sys, tempfile, threading, time, traceback
 
 import hou
 import hdefereval
@@ -33,10 +33,13 @@ DEFAULT_CONFIG = {
     "looks": {},                                    # set_look: {"sunny": 4, ...}
     "look_parms": {},                               # set_look: extra parm values per look {"night": {"/obj/x/ctl/night_sky": 1}}
     "auto_save": False,                             # save the .hip after every successful write (backup first)
-    "allow_reload": False                           # reload_listener tool: pick up new listener code from disk
+    "allow_reload": False,                          # reload_listener tool: pick up new listener code from disk
+    "camera_insert_before": "",                     # frame_camera: new camera LOPs are wired in above this LOP (default: karma_lop)
+    "occluder_sops": [],                            # frame_camera: SOP outputs to ray-test for things between camera and target
+    "front_axis": [0, 0, 1]                         # frame_camera: direction the facades face (camera stands out along this)
 }
 # commands that change the scene (auto_save runs after these when they succeed and weren't a dry run)
-WRITE_CMDS = {'set_parms', 'create_node', 'connect', 'set_look', 'run_python', 'undo', 'redo'}
+WRITE_CMDS = {'set_parms', 'create_node', 'connect', 'set_look', 'run_python', 'undo', 'redo', 'frame_camera'}
 CONFIG = dict(DEFAULT_CONFIG)
 
 def load_config():
@@ -281,10 +284,17 @@ def cmd_set_look(look):
             if p is not None: p.set(v)
     return {'look': look}
 
-def cmd_quick_render(camera, width=640, height=360, samples=24, look=None):
+def cmd_quick_render(camera, width=640, height=None, samples=24, look=None):
     """Karma render (blocking), so the agent can SEE the result. Returns the EXR path.
     Everything it changes (Karma settings, and the look if one is given) is put back exactly afterwards."""
     karma = _karma_lop()
+    if height is None:                          # match the camera's own frame shape (aperture ratio)
+        try:
+            prim = karma.stage().GetPrimAtPath(camera)
+            ha, va = prim.GetAttribute('horizontalAperture').Get(), prim.GetAttribute('verticalAperture').Get()
+            height = int(round(width * va / ha))
+        except Exception:
+            height = int(round(width * 9 / 16))
     with hou.undos.disabler():                  # the preview ROP is tooling, not part of the artist's undo history
         rop = hou.node('/out/houdini_mcp_rop') or hou.node('/out').createNode('usdrender', 'houdini_mcp_rop')
         rop.parm('loppath').set(karma.path())
@@ -316,6 +326,153 @@ def cmd_quick_render(camera, width=640, height=360, samples=24, look=None):
         raise RuntimeError('Karma produced no image after %ds (check the ROP /out/houdini_mcp_rop)' % (time.time() - t))
     return {'exr': out, 'seconds': round(time.time() - t, 1)}
 
+# ----------------------------------------------------------------------------- cameras
+# Rules learned on the SF Victorian project, built into one tool so an agent can't skip them:
+#  * derive the camera from the TARGET's bounding box, never hard-code coordinates
+#  * architecture: keep the camera LEVEL and use vertical LENS SHIFT, so walls stay vertical
+#  * set the camera's aspect ratio to the render resolution, or the vertical aperture silently stays 16:9
+#  * ray-test the line of sight; if geometry sits between camera and target, clip it with the near plane,
+#    placing the plane in open space (never slicing through a tree or lamp), and report it
+#  * judge framing with quick_render, NOT the GL viewport (flipbooks ignore lens settings)
+_HAP = 20.955
+
+def _bbox_of(target):
+    bb = None
+    for path in (target if isinstance(target, list) else [target]):
+        g = _node(path).geometry()
+        b = g.boundingBox()
+        if bb is None: bb = b
+        else: bb.enlargeToContain(b)
+    return bb
+
+def _first_hit(geos, orig, d, max_dist):
+    best = None
+    for g in geos:
+        pos, nrm, uvw = hou.Vector3(), hou.Vector3(), hou.Vector3()
+        pr = g.intersect(orig, d, pos, nrm, uvw, None, 0.01, max_dist)
+        if pr >= 0:
+            dist = (pos - orig).length()
+            if best is None or dist < best: best = dist
+    return best
+
+def _near_clip(eye, targets, d, bb=None):
+    """Find occluders between camera and target. Walks each ray all the way to the target (the first hit inside the
+    target's bbox), so long lenses that stand far back are handled too. Returns (near_clip or None, notes); the
+    clip goes in the open gap between the last occluder and the target, never inside an occluder."""
+    geos = [hou.node(p).geometry() for p in CONFIG['occluder_sops'] if hou.node(p) and hou.node(p).geometry()]
+    if not geos: return None, ['no occluder_sops configured: line of sight not checked']
+    def in_target(pt):
+        if bb is None: return False
+        mn, mx = bb.minvec(), bb.maxvec(); e = 0.05
+        return all(mn[i] - e <= pt[i] <= mx[i] + e for i in range(3))
+    last_occ, first_tgt = 0.0, None
+    for t in targets:
+        dirv = (t - eye); dist = dirv.length(); dirv = dirv.normalized()
+        travelled = 0.0
+        for _ in range(200):
+            o = eye + dirv * travelled
+            h = _first_hit(geos, o, dirv, dist + 1.0 - travelled)
+            if h is None: break
+            travelled += h
+            if in_target(eye + dirv * travelled):
+                first_tgt = travelled if first_tgt is None else min(first_tgt, travelled); break
+            last_occ = max(last_occ, travelled); travelled += 0.02
+    if last_occ <= 0: return None, ['line of sight clear']
+    gap_end = first_tgt if first_tgt is not None else d
+    if gap_end - last_occ < 0.2:
+        return last_occ + 0.1, ['occluder within 0.2 m of the target (%.1f m): near clip set right behind it; consider another angle' % last_occ]
+    near = last_occ + min(1.0, (gap_end - last_occ) * 0.5)
+    return near, ['geometry between camera and target up to %.1f m: near clip set to %.1f m, in the open gap before the target (%.1f m)' % (last_occ, near, gap_end)]
+
+def cmd_frame_camera(name, target, view='front', width=1280, height=720, margin=0.08, eye_height=1.6,
+                     distance=None, lens_mm=None, yaw_deg=35.0, elevation_deg=12.0, ground_y=None, dry_run=False):
+    """Create/update a camera LOP framing `target` (a SOP path, or list of them).
+    view='front': level, centred, lens-shifted (architecture).  view='angle': three-quarter look-at, yaw/elevation."""
+    bb = _bbox_of(target)
+    mn, mx = bb.minvec(), bb.maxvec(); c = bb.center()
+    ax = hou.Vector3(CONFIG['front_axis']).normalized()
+    side = ax.cross(hou.Vector3(0, 1, 0)).normalized()
+    W = abs((mx - mn).dot(side)); H = mx[1] - mn[1]
+    Wm, Hm = W * (1 + 2 * margin), H * (1 + 2 * margin)
+    vap = _HAP * height / float(width)
+    gy = mn[1] if ground_y is None else ground_y
+    notes = []
+    if view == 'front':
+        face = max((mx - c).dot(ax), (mn - c).dot(ax))                  # front face along the axis
+        if distance is None:
+            f = lens_mm or 35.0
+            distance = max(f * Wm / _HAP, f * Hm / vap)
+        f = lens_mm or min(_HAP * distance / Wm, vap * distance / Hm)
+        eye = c + ax * (face + distance); eye = hou.Vector3(eye[0], gy + eye_height, eye[2])
+        yaw = math.degrees(math.atan2(ax[0], ax[2])); pitch = 0.0
+        shift = (c[1] - eye[1]) * f / distance                          # vertical lens shift, mm
+        aim = [c]
+    else:
+        r = math.radians(yaw_deg); e = math.radians(elevation_deg)
+        dirv = (ax * math.cos(r) + side * math.sin(r)); dirv = hou.Vector3(dirv[0] * math.cos(e), math.sin(e), dirv[2] * math.cos(e))
+        f = lens_mm or 35.0
+        if distance is None:
+            # fit the 8 bbox corners on each axis separately (a bounding sphere wastes most of a wide frame)
+            fw = -dirv.normalized()
+            rt = fw.cross(hou.Vector3(0, 1, 0)).normalized(); up = rt.cross(fw).normalized()
+            k = 1.0 + 2 * margin; distance = 0.0
+            for cx in (mn[0], mx[0]):
+                for cy in (mn[1], mx[1]):
+                    for cz in (mn[2], mx[2]):
+                        q = hou.Vector3(cx, cy, cz) - c
+                        distance = max(distance, q.dot(dirv) + abs(q.dot(rt)) * k * 2 * f / _HAP,
+                                       q.dot(dirv) + abs(q.dot(up)) * k * 2 * f / vap)
+        eye = c + dirv * distance
+        if eye[1] < gy + eye_height: eye = hou.Vector3(eye[0], gy + eye_height, eye[2])
+        dv = c - eye
+        yaw = math.degrees(math.atan2(-dv[0], -dv[2])); pitch = math.degrees(math.atan2(dv[1], math.hypot(dv[0], dv[2])))
+        shift = 0.0; aim = [c]
+        notes.append('angle view: verticals will converge (tilted camera); use view="front" for straight walls')
+    corners = [hou.Vector3(x, y, z) for x in (mn[0], mx[0]) for y in (mn[1], mx[1]) for z in (mn[2], mx[2])]
+    near, n2 = _near_clip(eye, aim + corners, (c - eye).length(), bb); notes += n2
+    plan = {'camera': '/cameras/' + name, 'position': list(eye), 'rotate': [pitch, yaw, 0], 'focal_mm': round(f, 2),
+            'aperture_mm': [_HAP, round(vap, 3)], 'aspect': [width, height], 'vertical_shift_mm': round(shift, 3),
+            'near_clip': near, 'distance_m': round(distance, 2), 'target_size_m': [round(W, 2), round(H, 2)], 'notes': notes,
+            'preview': 'quick_render(camera="/cameras/%s", width=%d, height=%d)' % (name, min(width, 640), int(min(width, 640) * height / width))}
+    if dry_run:
+        plan['dry_run'] = True; return plan
+    node_name = 'mcp_cam_' + name
+    stage_net = hou.node('/stage')
+    before = hou.node(CONFIG['camera_insert_before'] or CONFIG['karma_lop'] or '')
+    if before is None: raise ValueError('set camera_insert_before or karma_lop in houdini_mcp_config.json')
+    _writable(stage_net.path() + '/' + node_name)
+    backup = _backup()
+    with hou.undos.group('MCP: frame_camera %s' % name):
+        cam = stage_net.node(node_name)
+        if cam is None:
+            cam = stage_net.createNode('camera', node_name)
+            cam.setInput(0, before.inputs()[0] if before.inputs() else None); before.setInput(0, cam)
+            cam.setPosition(before.position() + hou.Vector2(2, 0.6))
+        def sp(nm, v):
+            p = cam.parm(nm)
+            if p is None: return
+            ctl = cam.parm(nm + '_control')
+            if ctl is not None:
+                try: ctl.set('set')
+                except Exception: pass
+            p.set(v)
+        cam.parm('primpath').set('/cameras/' + name)
+        cam.parmTuple('t').set(tuple(eye)); cam.parmTuple('r').set((pitch, yaw, 0))
+        sp('focalLength', f); sp('horizontalAperture', _HAP); sp('verticalAperture', vap)
+        sp('aspectratiox', float(width)); sp('aspectratioy', float(height))
+        sp('verticalApertureOffset', shift); sp('horizontalApertureOffset', 0.0)
+        if cam.parmTuple('clippingRange'): cam.parmTuple('clippingRange').set((near or 0.1, 100000.0))
+        sp('focusDistance', (c - eye).length())
+    plan['node'] = cam.path(); plan['backup'] = backup
+    return plan
+
+def cmd_look_through(camera):
+    """Point the Scene Viewer at a camera prim (e.g. /cameras/cam_front) so the artist sees it."""
+    sv = hou.ui.paneTabOfType(hou.paneTabType.SceneViewer)
+    if sv is None: raise ValueError('no Scene Viewer open')
+    sv.curViewport().setCamera(camera)
+    return {'viewing': camera, 'note': 'the GL viewport ignores lens shift/aperture; trust quick_render for framing'}
+
 def cmd_save_backup():
     return {'backup': _backup()}
 
@@ -340,9 +497,15 @@ def _viewport_state(vp):
     for ds in _display_sets():
         try: shade.append((ds, vp.settings().displaySet(ds).shadedMode()))
         except Exception: pass
-    return {'cam': cam, 'view': vp.defaultCamera().stash(), 'shade': shade}
+    scheme = None
+    try: scheme = vp.settings().colorScheme()
+    except Exception: pass
+    return {'cam': cam, 'view': vp.defaultCamera().stash(), 'shade': shade, 'scheme': scheme}
 
 def _put_viewport_state(vp, st):
+    if st.get('scheme') is not None:
+        try: vp.settings().setColorScheme(st['scheme'])
+        except Exception: pass
     for ds, mode in st['shade']:
         try: vp.settings().displaySet(ds).setShadedMode(mode)
         except Exception: pass
@@ -351,8 +514,36 @@ def _put_viewport_state(vp, st):
         except Exception: pass
     vp.useDefaultCamera(); vp.setDefaultCamera(st['view'])
 
+def _set_background(vp, background):
+    """light | grey | dark viewport background (Houdini's colour schemes)."""
+    if not background: return
+    schemes = {'light': hou.viewportColorScheme.Light, 'grey': hou.viewportColorScheme.Grey,
+               'dark': hou.viewportColorScheme.Dark}
+    if background not in schemes: raise ValueError('background must be light, grey or dark')
+    vp.settings().setColorScheme(schemes[background])
+
+def _frame(vp, display=None):
+    """Frame the shown node's bounding box if one was given (frameAll would also fit ground planes, skies...)."""
+    if display:
+        try:
+            g = _node(display).geometry()
+            if g is not None: vp.frameBoundingBox(g.boundingBox()); return
+        except Exception: pass
+    vp.frameAll()
+
+def _show(path):
+    """Temporarily move the display flag to `path` (outside the undo history). Returns a function that puts it back."""
+    n = _node(path)
+    sibs = [c for c in n.parent().children() if hasattr(c, 'isDisplayFlagSet')]
+    was = [c for c in sibs if c.isDisplayFlagSet()]
+    with hou.undos.disabler(): n.setDisplayFlag(True)
+    def back():
+        with hou.undos.disabler():
+            for c in was: c.setDisplayFlag(True)
+    return back
+
 def cmd_viewport_snapshot(width=800, height=450, network=None, camera=None, frame_all=False, shading=None,
-                          frames=None, step=1, renderer='Houdini GL'):
+                          frames=None, step=1, renderer='Houdini GL', limit=48, display=None, background=None):
     """Capture the Scene Viewer with a flipbook (OpenGL, fast). Works in /obj and /stage.
     frames=[start, end] captures a range (playback). Everything changed for the capture (network, camera, view,
     shading, renderer, frame) is put back afterwards; the artist's viewport is left as it was."""
@@ -363,15 +554,17 @@ def cmd_viewport_snapshot(width=800, height=450, network=None, camera=None, fram
     f0, f1 = (frames if frames else (hou.frame(), hou.frame()))
     step = max(1, int(step))
     count = int((f1 - f0) // step) + 1
-    if count > 48: raise ValueError('%d frames: keep it to 48 or fewer (raise step)' % count)
+    limit = min(int(limit), 240)
+    if count > limit: raise ValueError('%d frames: keep it to %d or fewer (raise step)' % (count, limit))
     out_dir = _scratch('snapshots')
-    stamp = time.strftime('%H%M%S')
+    stamp = '%d' % (time.time() * 1000)            # unique per capture (ms), so back-to-back captures never collide
 
     # the artist's state, captured before touching anything
     frame_before = hou.frame()
     pwd_before = sv.pwd()
     home = _viewport_state(sv.curViewport())
     renderer_before = None
+    unshow = _show(display) if display else None
     try:
         switched = bool(network) and _node(network) != pwd_before
         if switched: sv.setPwd(_node(network))
@@ -389,7 +582,8 @@ def cmd_viewport_snapshot(width=800, height=450, network=None, camera=None, fram
             vp.setCamera(hou.node(camera) if camera.startswith('/obj/') else camera)
         if frame_all:
             if camera: vp.useDefaultCamera()
-            vp.frameAll()
+            _frame(vp, display)
+        _set_background(vp, background)
         if shading:
             for ds, _ in target['shade']:
                 try: vp.settings().displaySet(ds).setShadedMode(_shading_modes()[shading])
@@ -413,6 +607,7 @@ def cmd_viewport_snapshot(width=800, height=450, network=None, camera=None, fram
         except Exception: pass
         try: _put_viewport_state(sv.curViewport(), home)
         except Exception: pass
+        if unshow: unshow()
         hou.setFrame(frame_before)
     shots = []
     f = f0
@@ -422,6 +617,64 @@ def cmd_viewport_snapshot(width=800, height=450, network=None, camera=None, fram
         f += step
     if not shots: raise RuntimeError('flipbook produced no image (is the viewer showing anything?)')
     return {'images': shots, 'seconds': round(time.time() - t, 2), 'network': (network or sv.pwd().path())}
+
+def cmd_parm_sweep(node, parm, values, width=800, height=450, network=None, camera=None, frame_all=True,
+                   shading=None, renderer='Houdini GL', display=None, also_set=None, samples=24, background=None):
+    """Step one parameter through `values`, capturing the viewport at each (for sweep videos / GIFs).
+    Framing is held fixed: with frame_all, the view is framed once on the LAST value (usually the biggest).
+    also_set={parm_path: value} sets other parameters for the duration (e.g. a mode toggle).
+    renderer='karma' renders each value with quick_render through `camera` (slow, final look) instead of the viewport.
+    Every parameter is restored exactly afterwards and the changes never enter the undo history."""
+    n = _node(node); _writable(n.path())
+    p = n.parm(parm)
+    if p is None: raise ValueError('%s has no parm %s' % (node, parm))
+    if not values or len(values) > 120: raise ValueError('give 1-120 values')
+    sv = hou.ui.paneTabOfType(hou.paneTabType.SceneViewer)
+    if sv is None: raise ValueError('no Scene Viewer pane is open')
+    snap = _snapshot(p)
+    extra = []
+    for path, v in (also_set or {}).items():
+        q = hou.parm(path)
+        if q is None: raise ValueError('no parm %s' % path)
+        _writable(q.node().path()); extra.append((q, _snapshot(q), v))
+    pwd_before = sv.pwd(); home = _viewport_state(sv.curViewport()); target = None
+    shots = []
+    unshow = _show(display) if display else None
+    try:
+        with hou.undos.disabler():
+            for q, _, v in extra: q.deleteAllKeyframes(); q.set(v)
+            if network and _node(network) != pwd_before:
+                sv.setPwd(_node(network)); target = _viewport_state(sv.curViewport())
+            vp = sv.curViewport()
+            if (renderer or '').lower() == 'karma':
+                pass
+            elif camera:
+                vp.setCamera(hou.node(camera) if camera.startswith('/obj/') else camera)
+            elif frame_all:
+                p.deleteAllKeyframes(); p.set(values[-1])
+                vp.useDefaultCamera(); _frame(vp, display)
+            karma = (renderer or '').lower() == 'karma'
+            if karma and not camera: raise ValueError("renderer='karma' needs a camera")
+            for v in values:
+                p.deleteAllKeyframes(); p.set(v)
+                lab = '%s = %s' % (p.parmTemplate().label(), v)
+                if karma:
+                    r = cmd_quick_render(camera, width=width, height=height, samples=samples)
+                    shots.append({'exr': r['exr'], 'frame': len(shots) + 1, 'label': lab})
+                else:
+                    r = cmd_viewport_snapshot(width=width, height=height, shading=shading, renderer=renderer, background=background)
+                    shots.append(dict(r['images'][0], label=lab))
+    finally:
+        with hou.undos.disabler():
+            _restore(p, snap)
+            for q, sn, _ in extra: _restore(q, sn)
+            try:
+                if target is not None: _put_viewport_state(sv.curViewport(), target)
+                if sv.pwd() != pwd_before: sv.setPwd(pwd_before)
+                _put_viewport_state(sv.curViewport(), home)
+            except Exception: pass
+        if unshow: unshow()
+    return {'images': shots}
 
 def cmd_reload_listener():
     """Reload this module from disk and restart the listener, so code changes apply without the artist

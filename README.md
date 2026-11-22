@@ -28,10 +28,13 @@ project; its settings live in one config file (`examples/sf_victorian_house.json
 **Look at a scene**
 - `scene_info`: file, Houdini version, unsaved state, top-level nodes, the Solaris cameras, and any parameters you
   ask it to keep an eye on.
-- `list_nodes`, `get_parms`: browse the network; read values *and* expressions.
+- `list_nodes`, `get_parms`: browse the network (with each node's inputs, so the agent can follow the wiring); read values *and* expressions.
 - `geometry_stats`: point/prim counts, bounding box, groups, attributes, detail values, counts by name/material.
 - `dump_attribute`: the actual values of one attribute, so the agent checks real geometry instead of guessing.
 - `cook_and_check`: force-cook and report every node with an error, plus anything slow to cook.
+- `viewport_snapshot`: grab the Scene Viewer (fast OpenGL flipbook) in `/obj` or `/stage`, optionally through a
+  camera, framed on everything, or in wireframe/hidden-line. Give it `frames=[1, 48]` and it flipbooks the range and
+  returns a labelled contact sheet, so the agent can check playback. Your viewport is put back exactly as it was.
 - `quick_render`: a small Karma render through any camera, returned to the agent as an image.
 
 **Change a scene** (every edit has a `dry_run` mode that reports what *would* change)
@@ -43,6 +46,7 @@ project; its settings live in one config file (`examples/sf_victorian_house.json
 - `history`: the undo stack (agent edits are labelled `MCP: ...`), recent backups, unsaved state.
 - `undo`, `redo`: step through the agent's own edits; refuses to touch anything you did by hand.
 - `save_backup`, `save_scene`, `restore_backup`: numbered backups, saving, re-opening an older version.
+- `reload_listener`: reload the listener's code after you edit it. **Off unless the config allows it.**
 - `run_python`: arbitrary `hou` code for anything the tools don't cover. **Off unless you turn it on.**
 
 **Read your project's rules**
@@ -60,6 +64,7 @@ project; its settings live in one config file (`examples/sf_victorian_house.json
 | Previews | `quick_render` changes render settings temporarily, outside the undo history, and puts them back exactly (expressions and `$HIP` paths included). |
 | Python | `run_python` is disabled unless the project config says `"allow_python": true`. |
 | Audit | Every call is appended to `$HIP/mcp/audit.log`. |
+| No clutter | Viewport captures and preview renders go to the OS temp folder and are deleted as soon as the agent has them, like a browser-automation screenshot. Pass `save_to` to keep one. Leftovers older than a day are swept when the listener starts. |
 | Network | Listens on 127.0.0.1 only. |
 
 ---
@@ -109,6 +114,8 @@ Start `claude` in your project folder (restart it if it was already running, so 
 - *"Make a geo node in /obj with a box, a polybevel and a mountain SOP, then show me the geometry stats."*
 - *"Set the mountain height to 2 with a dry run first, then do it for real, then cook_and_check."*
 - *"Undo that last change."*
+- *"Take a viewport snapshot of /obj in wireframe, framed on everything."*
+- *"Flipbook frames 1 to 24 every 4 frames and tell me if anything pops."*
 - *"quick_render through /cameras/camera1 at 640x360."* (needs a Solaris stage with a camera and a Karma LOP)
 - *"What's the history? Restore the backup from before the bevel."*
 
@@ -129,6 +136,7 @@ Put a `houdini_mcp_config.json` next to your `.hip`. Every key is optional:
 |---|---|---|
 | `allowed_roots` | `["/obj", "/stage", "/out"]` | the only places the agent may edit |
 | `allow_python` | `false` | enable `run_python` |
+| `allow_reload` | `false` | enable `reload_listener` (pick up edited listener code without re-running `start_listener.py`) |
 | `auto_save` | `false` | save the `.hip` after every successful agent edit (backup first). Note this also saves any unsaved hand edits. |
 | `check_nodes` | displayed `/obj` nodes | what `cook_and_check` cooks by default |
 | `watch_parms` | `{}` | parameters shown in every `scene_info`, e.g. `{"/obj/geo1/asset": ["seed", "style"]}` |

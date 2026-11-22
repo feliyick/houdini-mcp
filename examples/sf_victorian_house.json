@@ -55,5 +55,6 @@
       "/obj/sf_house_geometry/STREET_CONTROLS/clouds": 1
     }
   },
-  "auto_save": true
+  "auto_save": true,
+  "allow_reload": true
 }

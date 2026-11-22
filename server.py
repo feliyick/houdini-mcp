@@ -115,6 +115,18 @@ def restore_backup(name: str, dry_run: bool = False) -> dict:
     return _call('restore_backup', timeout=600, name=name, dry_run=dry_run)
 
 @mcp.tool()
+def reload_listener() -> dict:
+    """Reload the listener's code inside Houdini (after editing houdini_listener.py). Needs "allow_reload": true
+    in the project config. Waits until the new listener answers."""
+    import time
+    res = _call('reload_listener')
+    for _ in range(30):
+        time.sleep(0.5)
+        try: return {'reloaded': res['reloading'], 'ping': _call('ping', timeout=5)['houdini']}
+        except Exception: pass
+    raise RuntimeError('listener did not come back after reload; re-run start_listener.py in Houdini')
+
+@mcp.tool()
 def run_python(code: str) -> dict:
     """Run hou Python in the session (disabled unless allow_python in the config). Put a return value in `result`."""
     return _call('run_python', timeout=600, code=code)
@@ -123,10 +135,61 @@ def run_python(code: str) -> dict:
 # ---------------------------------------------------------------- see
 @mcp.tool()
 def quick_render(camera: str, width: int = 640, height: int = 360, samples: int = 24,
-                 look: str | None = None) -> Image:
-    """Render a small Karma preview through a camera and return it as an image you can look at."""
+                 look: str | None = None, save_to: str | None = None) -> Image:
+    """Render a small Karma preview through a camera and return it as an image you can look at.
+    The render is deleted once returned; pass save_to (a .png path) to keep a copy."""
     res = _call('quick_render', timeout=900, camera=camera, width=width, height=height, samples=samples, look=look)
-    return Image(data=_exr_to_png(res['exr']), format='png')
+    try:
+        png = _exr_to_png(res['exr'])
+    finally:
+        _discard([res['exr']])
+    return _deliver(png, save_to)
+
+@mcp.tool()
+def viewport_snapshot(width: int = 800, height: int = 450, network: str | None = None, camera: str | None = None,
+                      frame_all: bool = False, shading: str | None = None, frames: list[float] | None = None,
+                      step: int = 1, renderer: str = 'Houdini GL', save_to: str | None = None) -> Image:
+    """Capture the Scene Viewer (fast OpenGL flipbook) and return it as an image. Works for /obj and /stage.
+    network: show this network instead of the current one (e.g. '/obj' or '/stage').
+    camera: look through a camera (/obj node path, or a USD prim path in /stage). frame_all: fit everything in view.
+    shading: smooth | flat | wire | wire_shaded | hidden_line.
+    frames: [start, end] to capture a frame range (playback); returned as one labelled contact sheet.
+    The artist's viewport (view, camera, shading, network, renderer, frame) is restored afterwards.
+    Captures are temporary (deleted once returned, like a browser-automation screenshot); pass save_to
+    (a .png path) to keep one."""
+    res = _call('viewport_snapshot', timeout=600, width=width, height=height, network=network, camera=camera,
+                frame_all=frame_all, shading=shading, frames=frames, step=step, renderer=renderer)
+    shots = res['images']
+    try:
+        png = open(shots[0]['png'], 'rb').read() if len(shots) == 1 else _contact_sheet(shots)
+    finally:
+        _discard([s['png'] for s in shots])
+    return _deliver(png, save_to)
+
+def _discard(paths):
+    for p in paths:
+        try: os.remove(p)
+        except OSError: pass
+
+def _deliver(png, save_to=None):
+    if save_to:
+        path = os.path.abspath(os.path.expanduser(save_to))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as f: f.write(png)
+    return Image(data=png, format='png')
+
+def _contact_sheet(shots, cols=4, max_w=1600):
+    import io
+    from PIL import Image as PILImage, ImageDraw
+    ims = [PILImage.open(s['png']).convert('RGB') for s in shots]
+    cols = min(cols, len(ims)); w, h = ims[0].size
+    scale = min(1.0, max_w / (cols * w)); tw, th = int(w * scale), int(h * scale)
+    rows = (len(ims) + cols - 1) // cols
+    sheet = PILImage.new('RGB', (cols * tw, rows * th), (20, 20, 20)); d = ImageDraw.Draw(sheet)
+    for i, (im, s) in enumerate(zip(ims, shots)):
+        x, y = (i % cols) * tw, (i // cols) * th
+        sheet.paste(im.resize((tw, th)), (x, y)); d.text((x + 6, y + 4), 'f%g' % s['frame'], fill=(255, 255, 0))
+    buf = io.BytesIO(); sheet.save(buf, 'PNG'); return buf.getvalue()
 
 def _exr_to_png(path):
     import io

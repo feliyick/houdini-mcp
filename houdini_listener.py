@@ -15,7 +15,7 @@ Guardrails:
   * run_python is OFF unless the config turns it on
   * every call is appended to $HIP/mcp/audit.log
 """
-import json, os, socket, sys, threading, time, traceback
+import json, os, socket, sys, tempfile, threading, time, traceback
 
 import hou
 import hdefereval
@@ -32,7 +32,8 @@ DEFAULT_CONFIG = {
     "look_switch": "",                              # set_look: a Switch LOP choosing the lighting look
     "looks": {},                                    # set_look: {"sunny": 4, ...}
     "look_parms": {},                               # set_look: extra parm values per look {"night": {"/obj/x/ctl/night_sky": 1}}
-    "auto_save": False                              # save the .hip after every successful write (backup first)
+    "auto_save": False,                             # save the .hip after every successful write (backup first)
+    "allow_reload": False                           # reload_listener tool: pick up new listener code from disk
 }
 # commands that change the scene (auto_save runs after these when they succeed and weren't a dry run)
 WRITE_CMDS = {'set_parms', 'create_node', 'connect', 'set_look', 'run_python', 'undo', 'redo'}
@@ -49,6 +50,24 @@ def load_config():
 # ----------------------------------------------------------------------------- helpers
 def _hip(*p):
     return os.path.join(hou.text.expandString('$HIP'), *p)
+
+def _scratch(*p):
+    """Throwaway images (viewport captures, preview renders) live in the OS temp folder, never the project.
+    The MCP server deletes each one right after reading it; start() sweeps anything older than a day."""
+    d = os.path.join(tempfile.gettempdir(), 'houdini-mcp', *p)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _sweep_scratch(max_age_h=24):
+    root = os.path.join(tempfile.gettempdir(), 'houdini-mcp')
+    n = 0
+    for dirpath, _, files in os.walk(root):
+        for f in files:
+            fp = os.path.join(dirpath, f)
+            try:
+                if time.time() - os.path.getmtime(fp) > max_age_h * 3600: os.remove(fp); n += 1
+            except OSError: pass
+    return n
 
 def _audit(cmd, args, ok, note=''):
     os.makedirs(_hip('mcp'), exist_ok=True)
@@ -126,7 +145,13 @@ def cmd_list_nodes(path='/obj', recursive=False, limit=300):
     nodes = root.allSubChildren() if recursive else root.children()
     out = []
     for n in nodes[:limit]:
-        out.append({'path': n.path(), 'type': n.type().name(), 'errors': bool(n.errors()), 'warnings': bool(n.warnings())})
+        e = {'path': n.path(), 'type': n.type().name(), 'errors': bool(n.errors()), 'warnings': bool(n.warnings())}
+        ins = [i.path() if i else None for i in n.inputs()]
+        if any(ins): e['inputs'] = ins                      # wiring, so the agent can follow the graph
+        try:
+            if n.isDisplayFlagSet(): e['display'] = True
+        except AttributeError: pass
+        out.append(e)
     return {'count': len(nodes), 'nodes': out}
 
 def cmd_get_parms(node, names=None, contains=None):
@@ -269,8 +294,7 @@ def cmd_quick_render(camera, width=640, height=360, samples=24, look=None):
             if p.parmTemplate().type() != hou.parmTemplateType.Toggle: continue
             if 'mplay' in lab or 'background' in lab or 'async' in lab: p.set(0)
             elif 'wait' in lab or 'block' in lab: p.set(1)
-    out = _hip('mcp', 'renders', '%s_%s.exr' % (time.strftime('%H%M%S'), camera.split('/')[-1]))
-    os.makedirs(os.path.dirname(out), exist_ok=True)
+    out = os.path.join(_scratch('renders'), '%s_%s.exr' % (time.strftime('%H%M%S'), camera.split('/')[-1]))
     touched = [karma.parm(nm) for nm in ('camera', 'picture', 'resolutionx', 'resolutiony', 'pathtracedsamples') if karma.parm(nm)]
     if look:
         if not CONFIG['look_switch']: raise ValueError('no look_switch configured in houdini_mcp_config.json')
@@ -294,6 +318,124 @@ def cmd_quick_render(camera, width=640, height=360, samples=24, look=None):
 
 def cmd_save_backup():
     return {'backup': _backup()}
+
+# ----------------------------------------------------------------------------- viewport
+def _shading_modes():
+    return {'smooth': hou.glShadingType.Smooth, 'flat': hou.glShadingType.Flat, 'wire': hou.glShadingType.Wire,
+            'wire_shaded': hou.glShadingType.SmoothWire, 'hidden_line': hou.glShadingType.HiddenLineInvisible}
+
+def _display_sets():
+    return [v for v in hou.displaySetType.__dict__.values() if isinstance(v, hou.EnumValue)]
+
+def _viewport_state(vp):
+    """Everything a capture may change on one viewport. Read it ALL before changing anything: some display
+    sets are linked, so changing one changes another."""
+    cam = None
+    try: cam = vp.camera()
+    except Exception: pass
+    if cam is None:
+        try: cam = vp.cameraPath() or None
+        except Exception: pass
+    shade = []
+    for ds in _display_sets():
+        try: shade.append((ds, vp.settings().displaySet(ds).shadedMode()))
+        except Exception: pass
+    return {'cam': cam, 'view': vp.defaultCamera().stash(), 'shade': shade}
+
+def _put_viewport_state(vp, st):
+    for ds, mode in st['shade']:
+        try: vp.settings().displaySet(ds).setShadedMode(mode)
+        except Exception: pass
+    if st['cam'] is not None:
+        try: vp.setCamera(st['cam']); return
+        except Exception: pass
+    vp.useDefaultCamera(); vp.setDefaultCamera(st['view'])
+
+def cmd_viewport_snapshot(width=800, height=450, network=None, camera=None, frame_all=False, shading=None,
+                          frames=None, step=1, renderer='Houdini GL'):
+    """Capture the Scene Viewer with a flipbook (OpenGL, fast). Works in /obj and /stage.
+    frames=[start, end] captures a range (playback). Everything changed for the capture (network, camera, view,
+    shading, renderer, frame) is put back afterwards; the artist's viewport is left as it was."""
+    sv = hou.ui.paneTabOfType(hou.paneTabType.SceneViewer)
+    if sv is None: raise ValueError('no Scene Viewer pane is open')
+    if shading and shading not in _shading_modes():
+        raise ValueError('shading must be one of %s' % sorted(_shading_modes()))
+    f0, f1 = (frames if frames else (hou.frame(), hou.frame()))
+    step = max(1, int(step))
+    count = int((f1 - f0) // step) + 1
+    if count > 48: raise ValueError('%d frames: keep it to 48 or fewer (raise step)' % count)
+    out_dir = _scratch('snapshots')
+    stamp = time.strftime('%H%M%S')
+
+    # the artist's state, captured before touching anything
+    frame_before = hou.frame()
+    pwd_before = sv.pwd()
+    home = _viewport_state(sv.curViewport())
+    renderer_before = None
+    try:
+        switched = bool(network) and _node(network) != pwd_before
+        if switched: sv.setPwd(_node(network))
+        vp = sv.curViewport()
+        target = _viewport_state(vp) if switched else home
+        is_lop = False
+        try: is_lop = sv.pwd().childTypeCategory() == hou.lopNodeTypeCategory()
+        except Exception: pass
+        if renderer and is_lop and hasattr(sv, 'currentHydraRenderer'):   # Hydra renderers only exist in Solaris
+            try:
+                cur = sv.currentHydraRenderer()
+                if cur and cur != renderer: sv.setHydraRenderer(renderer); renderer_before = cur
+            except Exception: pass
+        if camera:
+            vp.setCamera(hou.node(camera) if camera.startswith('/obj/') else camera)
+        if frame_all:
+            if camera: vp.useDefaultCamera()
+            vp.frameAll()
+        if shading:
+            for ds, _ in target['shade']:
+                try: vp.settings().displaySet(ds).setShadedMode(_shading_modes()[shading])
+                except Exception: pass
+        fb = sv.flipbookSettings().stash()              # a copy: the artist's flipbook settings are untouched
+        fb.outputToMPlay(False)
+        fb.frameRange((f0, f1)); fb.frameIncrement(step)
+        fb.output(os.path.join(out_dir, stamp + '.$F4.png'))
+        fb.useResolution(True); fb.resolution((int(width), int(height)))
+        t = time.time(); sv.flipbook(vp, fb)
+    finally:
+        # put back in reverse: target network's viewport, renderer, network, then the artist's own viewport
+        try:
+            if network and sv.pwd() != pwd_before: _put_viewport_state(sv.curViewport(), target)
+        except Exception: pass
+        if renderer_before:
+            try: sv.setHydraRenderer(renderer_before)
+            except Exception: pass
+        try:
+            if sv.pwd() != pwd_before: sv.setPwd(pwd_before)
+        except Exception: pass
+        try: _put_viewport_state(sv.curViewport(), home)
+        except Exception: pass
+        hou.setFrame(frame_before)
+    shots = []
+    f = f0
+    while f <= f1 + 1e-6:
+        p = os.path.join(out_dir, '%s.%04d.png' % (stamp, int(round(f))))
+        if os.path.exists(p): shots.append({'frame': f, 'png': p})
+        f += step
+    if not shots: raise RuntimeError('flipbook produced no image (is the viewer showing anything?)')
+    return {'images': shots, 'seconds': round(time.time() - t, 2), 'network': (network or sv.pwd().path())}
+
+def cmd_reload_listener():
+    """Reload this module from disk and restart the listener, so code changes apply without the artist
+    re-pasting start_listener.py. Off unless the project config sets "allow_reload": true."""
+    if not CONFIG.get('allow_reload'):
+        raise PermissionError('reload_listener is disabled (set "allow_reload": true in houdini_mcp_config.json)')
+    mod = sys.modules[__name__]
+    def later():                                   # runs after this reply has gone out
+        import importlib
+        mod.stop(); importlib.reload(mod)
+        hou.session.mcp_listener = mod
+        mod.start()
+    hdefereval.executeDeferred(later)
+    return {'reloading': os.path.abspath(__file__)}
 
 # ----------------------------------------------------------------------------- save / undo / recover
 MCP_TAG = 'MCP:'        # every agent write is an undo group labelled 'MCP: ...'
@@ -427,10 +569,12 @@ def start():
     if _server and _server.running:
         print('houdini MCP listener already running on %s:%d' % (HOST, PORT)); return
     cfg = load_config()
+    swept = _sweep_scratch()
     _server = _Server(); _server.start()
     print('houdini MCP listener on %s:%d  config: %s' % (HOST, PORT, cfg or 'defaults (no $HIP/houdini_mcp_config.json)'))
     print('   writes limited to %s, run_python %s, auto_save %s' % (CONFIG['allowed_roots'],
           'ON' if CONFIG['allow_python'] else 'off', 'ON' if CONFIG['auto_save'] else 'off'))
+    if swept: print('   cleared %d old capture(s) from %s' % (swept, _scratch()))
 
 def stop():
     global _server

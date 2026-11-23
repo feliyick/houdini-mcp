@@ -36,10 +36,12 @@ DEFAULT_CONFIG = {
     "allow_reload": False,                          # reload_listener tool: pick up new listener code from disk
     "camera_insert_before": "",                     # frame_camera: new camera LOPs are wired in above this LOP (default: karma_lop)
     "occluder_sops": [],                            # frame_camera: SOP outputs to ray-test for things between camera and target
-    "front_axis": [0, 0, 1]                         # frame_camera: direction the facades face (camera stands out along this)
+    "front_axis": [0, 0, 1],                        # frame_camera: direction the facades face (camera stands out along this)
+    "synth_label_overrides": {},                    # synth_render: parms set for the label pass, e.g. {"/stage/opaque_switch/input": 1}
+    "synth_label_sop": ""                           # synth_render: SOP whose prims carry the labels (ground truth for repair)
 }
 # commands that change the scene (auto_save runs after these when they succeed and weren't a dry run)
-WRITE_CMDS = {'set_parms', 'create_node', 'connect', 'set_look', 'run_python', 'undo', 'redo', 'frame_camera', 'revert_hda'}
+WRITE_CMDS = {'set_parms', 'create_node', 'connect', 'set_look', 'run_python', 'undo', 'redo', 'frame_camera', 'revert_hda', 'hda_edit', 'hda_save'}
 CONFIG = dict(DEFAULT_CONFIG)
 
 def load_config():
@@ -884,6 +886,39 @@ def cmd_parm_sweep(node, parm, values, width=800, height=450, network=None, came
                 except Exception: pass
     return {'images': shots}
 
+def _hda_of(node):
+    n = _node(node)
+    d = n.type().definition()
+    if d is None: raise ValueError('%s is not an HDA instance' % node)
+    return n, d
+
+def cmd_hda_edit(node, dry_run=False):
+    """Unlock an HDA instance so its contents can be edited with the normal tools (create_node, connect, set_parms).
+    Copies the .hdanc/.hda library to <library folder>/backup/ first. Finish with hda_save (or revert_hda to discard)."""
+    n, d = _hda_of(node); _writable(n.path())
+    lib = d.libraryFilePath()
+    if dry_run: return {'dry_run': True, 'would_unlock': n.path(), 'library': lib, 'locked': n.isLockedHDA()}
+    import shutil
+    bdir = os.path.join(os.path.dirname(lib), 'backup'); os.makedirs(bdir, exist_ok=True)
+    stem, ext = os.path.splitext(os.path.basename(lib))
+    lib_backup = os.path.join(bdir, '%s_%s%s' % (stem, time.strftime('%Y%m%d_%H%M%S'), ext))
+    shutil.copy2(lib, lib_backup)
+    backup = _backup()
+    with hou.undos.group('MCP: hda_edit %s' % n.name()):
+        n.allowEditingOfContents()
+    return {'unlocked': n.path(), 'library_backup': lib_backup, 'backup': backup}
+
+def cmd_hda_save(node, dry_run=False):
+    """Save an unlocked HDA instance's contents into its definition (every instance of the asset updates), then
+    re-lock it. The library was backed up by hda_edit."""
+    n, d = _hda_of(node); _writable(n.path())
+    if n.isLockedHDA(): raise ValueError('%s is locked: nothing to save (use hda_edit first)' % n.path())
+    if dry_run: return {'dry_run': True, 'would_save': d.nodeTypeName(), 'library': d.libraryFilePath()}
+    backup = _backup()
+    d.updateFromNode(n)
+    n.matchCurrentDefinition()
+    return {'saved': d.nodeTypeName(), 'library': d.libraryFilePath(), 'locked': n.isLockedHDA(), 'backup': backup}
+
 def cmd_revert_hda(node, dry_run=False):
     """Re-match an HDA instance to its saved definition (discards that instance's local edits: unlocked contents,
     flipped flags, temporary nodes). Backed up first."""
@@ -894,6 +929,97 @@ def cmd_revert_hda(node, dry_run=False):
     with hou.undos.group('MCP: revert_hda %s' % n.name()):
         n.matchCurrentDefinition()
     return {'reverted': n.path(), 'locked': n.isLockedHDA(), 'backup': backup}
+
+def _valid_ids(label_sop):
+    """Unique (instance_id, semantic_id, parent_id) combinations on the label geometry: the ground truth the
+    rendered ID layers are checked and repaired against (edge pixels can come out blended)."""
+    if not label_sop: return None
+    g = _node(label_sop).geometry()
+    if g is None or g.findPrimAttrib('instance_id') is None: return None
+    ins, sem = g.primIntAttribValues('instance_id'), g.primIntAttribValues('semantic_id')
+    par = g.primIntAttribValues('parent_id') if g.findPrimAttrib('parent_id') else [0] * len(ins)
+    return sorted({(a, b, c) for a, b, c in zip(ins, sem, par)})
+
+def cmd_synth_render(camera, seeds=None, seed_parm=None, width=640, height=None, samples=24, look=None,
+                     id_primvars=('semantic_id', 'instance_id', 'parent_id'), label_overrides=None, label_samples=8,
+                     label_sop=None):
+    """Synthetic data frames. Per seed, two Karma renders through `camera`:
+      beauty : the scene as it is
+      labels : `label_overrides` applied (parm path -> value, e.g. a switch to opaque materials: transparent glass
+               would otherwise blend IDs) and the ID primvars rendered as AOVs with a 'most coverage wins' filter.
+    Defaults for label_overrides come from the config key synth_label_overrides. Everything is restored."""
+    karma = _karma_lop()
+    cnt = karma.parm('extrarendervars')
+    if cnt is None: raise ValueError('%s has no extra render vars list' % karma.path())
+    sp = hou.parm(seed_parm) if seed_parm else None
+    if seeds and sp is None: raise ValueError('seeds given but no valid seed_parm')
+    overrides = CONFIG.get('synth_label_overrides', {}) if label_overrides is None else label_overrides
+    label_sop = label_sop or CONFIG.get('synth_label_sop') or None
+    n0 = cnt.eval(); seed_snap = _snapshot(sp) if sp else None
+    out = []
+    def set_vars(on):
+        with hou.undos.disabler():
+            cnt.set(n0 + (len(id_primvars) if on else 0))
+            if not on: return
+            for k, pv in enumerate(id_primvars):
+                i = n0 + 1 + k
+                for nm, v in (('enable', 1), ('name', pv), ('sourceName', pv), ('sourceType', 'primvar'),
+                              ('dataType', 'float'), ('format', 'float'), ('filter', '["minmax",{"mode":"idcover"}]')):
+                    q = karma.parm('%s%d' % (nm, i))
+                    if q is not None: q.set(v)
+    try:
+        for sd in (seeds or [None]):
+            if sd is not None:
+                with hou.undos.disabler(): sp.deleteAllKeyframes(); sp.set(sd)
+            rb = cmd_quick_render(camera, width=width, height=height, samples=samples, look=look)
+            set_vars(True); unset = _also_set(overrides) if overrides else None
+            try:
+                rl = cmd_quick_render(camera, width=width, height=height, samples=label_samples, look=look)
+            finally:
+                if unset: unset()
+                set_vars(False)
+            out.append({'seed': sd, 'beauty': rb['exr'], 'labels': rl['exr'], 'seconds': rb['seconds'] + rl['seconds'],
+                        'ids': _valid_ids(label_sop)})
+    finally:
+        set_vars(False)
+        if sp is not None:
+            with hou.undos.disabler(): _restore(sp, seed_snap)
+    apprentice = False
+    try: apprentice = hou.licenseCategory() == hou.licenseCategoryType.Apprentice
+    except Exception: pass
+    return {'frames': out, 'layers': list(id_primvars), 'apprentice': apprentice}
+
+def cmd_stage_info(lop, root='/', depth=3, attrs=True, limit=300, attr_filter=None):
+    """Read-only look at a LOP's USD stage: prims under `root` (to `depth` levels) with type, and authored attributes."""
+    st = _node(lop).stage()
+    if st is None: raise ValueError('%s has no stage' % lop)
+    rp = st.GetPrimAtPath(root)
+    if not rp or not rp.IsValid(): raise ValueError('no prim at %s' % root)
+    out = []
+    base = len(str(rp.GetPath()).rstrip('/').split('/'))
+    for p in st.Traverse():
+        ps = str(p.GetPath())
+        if not (ps == root or ps.startswith(root.rstrip('/') + '/')): continue
+        if len(ps.split('/')) - base > depth: continue
+        e = {'path': ps, 'type': str(p.GetTypeName())}
+        if attrs:
+            vals = {}
+            al = [a for a in p.GetAuthoredAttributes() if not attr_filter or attr_filter in a.GetName()]
+            for a in al[:40]:
+                try: v = a.Get()
+                except Exception: v = None
+                vals[a.GetName()] = _jsonable(v if not hasattr(v, '__len__') or isinstance(v, str) or len(v) < 12 else '<%d values>' % len(v))
+                try:
+                    from pxr import UsdGeom
+                    pv = UsdGeom.Primvar(a)
+                    if pv and pv.IsPrimvar(): vals[a.GetName() + ' (interp)'] = str(pv.GetInterpolation())
+                except Exception: pass
+            for r in p.GetAuthoredRelationships()[:10]:
+                vals[r.GetName()] = [str(t) for t in r.GetTargets()]
+            e['attrs'] = vals
+        out.append(e)
+        if len(out) >= limit: break
+    return {'prims': out, 'count': len(out)}
 
 def cmd_reload_listener():
     """Reload this module from disk and restart the listener, so code changes apply without the artist

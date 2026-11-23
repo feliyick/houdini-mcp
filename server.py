@@ -5,7 +5,7 @@ Forwards each tool call to houdini_listener.py running in your open Houdini.
 Register once (from the repo folder):
     claude mcp add houdini -- "$PWD/.venv/bin/python" "$PWD/server.py"
 """
-import json, os, socket, itertools
+import io, json, os, socket, itertools
 from mcp.server.fastmcp import FastMCP, Image
 
 HOST, PORT = '127.0.0.1', 9876
@@ -116,9 +116,25 @@ def restore_backup(name: str, dry_run: bool = False) -> dict:
     return _call('restore_backup', timeout=600, name=name, dry_run=dry_run)
 
 @mcp.tool()
+def hda_edit(node: str, dry_run: bool = False) -> dict:
+    """Unlock an HDA instance for editing (backs up the HDA library file first). Then use create_node / connect /
+    set_parms inside it, and finish with hda_save, or revert_hda to throw the edits away."""
+    return _call('hda_edit', node=node, dry_run=dry_run)
+
+@mcp.tool()
+def hda_save(node: str, dry_run: bool = False) -> dict:
+    """Save the unlocked HDA instance's contents into its definition (all instances update) and re-lock it."""
+    return _call('hda_save', node=node, dry_run=dry_run)
+
+@mcp.tool()
 def revert_hda(node: str, dry_run: bool = False) -> dict:
     """Re-match an HDA instance to its saved definition (relocks it; discards that instance's local edits). Backed up first."""
     return _call('revert_hda', node=node, dry_run=dry_run)
+
+@mcp.tool()
+def stage_info(lop: str, root: str = '/', depth: int = 3, attrs: bool = True, limit: int = 300, attr_filter: str | None = None) -> dict:
+    """Read-only: the USD stage at a LOP node, prims under `root` (to `depth` levels) with type and authored attributes."""
+    return _call('stage_info', lop=lop, root=root, depth=depth, attrs=attrs, limit=limit, attr_filter=attr_filter)
 
 @mcp.tool()
 def reload_listener() -> dict:
@@ -314,6 +330,142 @@ def _encode(shots, save_to, fps, labels):
                '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '20', '-movflags', '+faststart', path]
         subprocess.run(cmd, check=True)
     return path
+
+
+# ---------------------------------------------------------------- synthetic data
+SYNTH_CLASSES = {  # id: (name, preview colour)  - keep in sync with the scene's semantic_labels / street labels
+    0: ('background', (0, 0, 0)), 1: ('wall', (128, 128, 128)), 2: ('window', (0, 200, 230)), 3: ('door', (0, 200, 100)),
+    4: ('garage', (230, 220, 0)), 5: ('bay', (255, 0, 128)), 6: ('stairs', (255, 150, 0)), 7: ('porch', (150, 90, 230)),
+    8: ('roof', (140, 80, 40)), 9: ('ornament', (255, 255, 255)), 10: ('house_number', (230, 30, 30)),
+    11: ('road', (50, 50, 60)), 12: ('sidewalk', (190, 190, 180)), 13: ('vegetation', (40, 140, 40)),
+    14: ('street_furniture', (60, 90, 220)), 15: ('distant_building', (200, 170, 130)),
+}
+
+@mcp.tool()
+def synth_render(out_dir: str, camera: str, seeds: list[int] | None = None,
+                 seed_parm: str | None = None, width: int = 640, height: int | None = None,
+                 samples: int = 24, look: str | None = None, name: str = 'synth', label_samples: int = 8,
+                 label_overrides: dict | None = None, ignore_box: list[float] | None = None, min_area: int = 16) -> list:
+    """Synthetic training data: for each seed, render beauty + per-pixel class and instance labels (from the scene's
+    semantic_id / instance_id / parent_id primvars) through `camera`, and write a COCO dataset to out_dir:
+      images/<name>_<seed>.png                beauty
+      labels/<name>_<seed>_class.png          class id per pixel (8-bit)   + _class_vis.png colour preview
+      labels/<name>_<seed>_instance.png       instance id per pixel (16-bit)
+      annotations.json                        COCO: images, categories, annotations (bbox, RLE mask, area, parent_id)
+    seed_parm: the parameter the seeds go into (e.g. /obj/geo/asset/seed). Restores everything afterwards.
+    Labels come from a second, opaque render (label_overrides, default from the config's synth_label_overrides) so
+    glass doesn't blend IDs. ignore_box [x0,y0,x1,y1] (fractions) is marked class 255 / left out of annotations;
+    under an Apprentice licence it defaults to the watermark corner. Instances smaller than min_area px are dropped.
+    Returns a preview (beauty | classes | instances of the first frame) plus a summary."""
+    import json as _json, numpy as np, OpenEXR
+    from PIL import Image as PILImage
+    res = _call('synth_render', timeout=7200, camera=camera, seeds=seeds, seed_parm=seed_parm, width=width,
+                height=height, samples=samples, look=look, label_samples=label_samples, label_overrides=label_overrides)
+    if ignore_box is None and res.get('apprentice'): ignore_box = [0.68, 0.80, 0.975, 0.965]
+    out_dir = os.path.abspath(os.path.expanduser(out_dir))
+    os.makedirs(os.path.join(out_dir, 'images'), exist_ok=True); os.makedirs(os.path.join(out_dir, 'labels'), exist_ok=True)
+    coco = {'info': {'description': 'houdini-mcp synthetic data', 'camera': camera},
+            'categories': [{'id': k, 'name': v[0]} for k, v in SYNTH_CLASSES.items() if k > 0],
+            'images': [], 'annotations': []}
+    lut = np.zeros((256, 3), np.uint8); lut[255] = (255, 0, 255)                  # 255 = ignore (magenta in preview)
+    for k, (_, c) in SYNTH_CLASSES.items(): lut[k] = c
+    preview = None; ann_id = 1; repaired_total = 0
+    try:
+        for fi, fr in enumerate(res['frames']):
+            exf = OpenEXR.File(fr['labels']); ch = {}
+            for part in exf.parts:                                   # Karma writes AOVs into extra EXR parts
+                for k, v in part.channels.items(): ch.setdefault(k, v)
+            def layer(nm):
+                for key in (nm, nm + '.R', nm + '.r', nm + '.Y'):
+                    if key in ch: return ch[key].pixels.astype(np.float32).reshape(ch[key].pixels.shape[:2])
+                cands = [k for k in ch if k.split('.')[0] == nm]
+                if cands: return ch[cands[0]].pixels.astype(np.float32)[..., 0] if ch[cands[0]].pixels.ndim == 3 else ch[cands[0]].pixels.astype(np.float32)
+                raise RuntimeError('EXR has no %s layer (has %s)' % (nm, sorted(ch)))
+            sem = np.rint(layer('semantic_id')).astype(np.int32); ins = np.rint(layer('instance_id')).astype(np.int32)
+            par = np.rint(layer('parent_id')).astype(np.int32)
+            repaired = 0
+            if fr.get('ids'):                                                # repair blended edge pixels
+                sem, ins, par, repaired = _repair_ids(sem, ins, fr['ids'])
+            beauty = _exr_to_png(fr['beauty'])
+            stem = '%s_%s' % (name, fr['seed'] if fr['seed'] is not None else fi)
+            h, w = sem.shape
+            if ignore_box:                                                   # e.g. the Apprentice watermark
+                bx0, by0, bx1, by1 = int(ignore_box[0] * w), int(ignore_box[1] * h), int(ignore_box[2] * w), int(ignore_box[3] * h)
+                sem[by0:by1, bx0:bx1] = 255; ins[by0:by1, bx0:bx1] = 0; par[by0:by1, bx0:bx1] = 0
+            open(os.path.join(out_dir, 'images', stem + '.png'), 'wb').write(beauty)
+            PILImage.fromarray(sem.clip(0, 255).astype(np.uint8)).save(os.path.join(out_dir, 'labels', stem + '_class.png'))
+            vis = lut[sem.clip(0, 255)]
+            PILImage.fromarray(vis).save(os.path.join(out_dir, 'labels', stem + '_class_vis.png'))
+            PILImage.fromarray(ins.clip(0, 65535).astype(np.uint16)).save(os.path.join(out_dir, 'labels', stem + '_instance.png'))
+            img_id = fi + 1
+            repaired_total += repaired
+            coco['images'].append({'id': img_id, 'file_name': 'images/%s.png' % stem, 'width': w, 'height': h, 'seed': fr['seed'],
+                                   'ignore_box': [int(v * (w if k % 2 == 0 else h)) for k, v in enumerate(ignore_box)] if ignore_box else None})
+            for iid in np.unique(ins):
+                if iid <= 0: continue
+                m = ins == iid
+                if m.sum() < min_area: continue
+                classes = sem[m]; classes = classes[classes != 255]; core = classes[classes != 9]
+                if not classes.size: continue                 # ornament rides on its parent object
+                cat = int(np.bincount(core if core.size else classes).argmax())
+                ys, xs = np.nonzero(m)
+                x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+                flat = m.flatten(order='F').astype(np.uint8)                   # COCO uncompressed RLE: column-major
+                change = np.flatnonzero(np.diff(np.concatenate([[0], flat, [0]])))
+                counts = np.diff(np.concatenate([[0], change])).tolist()
+                if flat[0] == 1: counts = [0] + counts
+                pid = int(np.bincount(par[m].clip(0)).argmax())
+                coco['annotations'].append({'id': ann_id, 'image_id': img_id, 'category_id': cat, 'instance_id': int(iid),
+                                            'parent_instance_id': pid, 'bbox': [x0, y0, x1 - x0, y1 - y0],
+                                            'area': int(m.sum()), 'iscrowd': 0,
+                                            'segmentation': {'size': [h, w], 'counts': counts}})
+                ann_id += 1
+            if preview is None:
+                ivis = np.zeros((h, w, 3), np.uint8)
+                for iid in np.unique(ins):
+                    if iid > 0: ivis[ins == iid] = ((iid * 97) % 255, (iid * 57) % 255, (iid * 173) % 255)
+                b = PILImage.open(io.BytesIO(beauty)).convert('RGB')
+                sheet = PILImage.new('RGB', (w * 3, h)); sheet.paste(b, (0, 0)); sheet.paste(PILImage.fromarray(vis), (w, 0))
+                sheet.paste(PILImage.fromarray(ivis), (w * 2, 0))
+                buf = io.BytesIO(); sheet.save(buf, 'PNG'); preview = buf.getvalue()
+    finally:
+        _discard([fr[k] for fr in res['frames'] for k in ('beauty', 'labels')])
+    for a in coco['annotations']:                                              # parent instance -> parent annotation id
+        a['parent_id'] = next((b['id'] for b in coco['annotations'] if b['image_id'] == a['image_id'] and b['instance_id'] == a['parent_instance_id']), 0) if a['parent_instance_id'] else 0
+    path = os.path.join(out_dir, 'annotations.json')
+    with open(path, 'w') as f: _json.dump(coco, f)
+    summary = {'out_dir': out_dir, 'images': len(coco['images']), 'annotations': len(coco['annotations']),
+               'repaired_edge_pixels': repaired_total,
+               'per_class': {}}
+    for a in coco['annotations']:
+        nm = SYNTH_CLASSES[a['category_id']][0]; summary['per_class'][nm] = summary['per_class'].get(nm, 0) + 1
+    return [Image(data=preview, format='png'), _json.dumps(summary)]
+
+def _repair_ids(sem, ins, triples, iters=8):
+    """Pixels whose (instance, class) pair isn't on the geometry are blends of neighbours: replace each with the most
+    common valid pair among its 8 neighbours (repeat to fill wider bands). Parent comes from the geometry lookup."""
+    import numpy as np
+    valid = {(a, b): c for a, b, c in triples}
+    valid[(0, 0)] = 0
+    code = ins.astype(np.int64) * 64 + sem.clip(0, 63)
+    vcodes = np.array(sorted(a * 64 + b for a, b in valid), np.int64)
+    bad = ~np.isin(code, vcodes); start = int(bad.sum())
+    h, w = code.shape
+    for _ in range(iters):
+        if not bad.any(): break
+        ys, xs = np.nonzero(bad)
+        new = code.copy(); fixed = np.zeros_like(bad)
+        for y, x in zip(ys, xs):
+            nb = code[max(0, y - 1):y + 2, max(0, x - 1):x + 2][~bad[max(0, y - 1):y + 2, max(0, x - 1):x + 2]]
+            if nb.size:
+                vals, cnts = np.unique(nb, return_counts=True); new[y, x] = vals[cnts.argmax()]; fixed[y, x] = True
+        code = new; bad = bad & ~fixed
+    code[bad] = 0                                                         # unreachable leftovers -> background
+    ins2 = (code // 64).astype(np.int32); sem2 = (code % 64).astype(np.int32)
+    par2 = np.zeros_like(ins2)
+    for (a, b), c in valid.items():
+        if c: par2[ins2 == a] = c
+    return sem2, ins2, par2, start
 
 def _contact_sheet(shots, cols=4, max_w=1600):
     import io

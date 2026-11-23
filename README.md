@@ -44,6 +44,19 @@ project; its settings live in one config file (`examples/sf_victorian_house.json
   parameters for the duration (a mode toggle, a lighting look), and everything is restored afterwards.
   `renderer='karma'` renders each step in Karma through a camera for final-quality sweeps.
 
+**Synthetic training data**
+- `synth_render`: for each seed and camera, renders the beauty image plus per-pixel **class** and **instance** labels
+  and writes a COCO dataset (`images/`, `labels/` and `annotations.json` with boxes, run-length masks and parent links,
+  e.g. a bay window inside its bay). Labels come from integer prim attributes on your geometry
+  (`semantic_id`, `instance_id`, `parent_id`), rendered as Karma AOVs in a second, opaque pass. Edge pixels that Karma
+  blends are repaired against the exact set of IDs on the geometry. Under an Apprentice licence the watermark corner
+  is marked "ignore".
+- `stage_info`: read-only look at a LOP's USD stage (prims, types, attributes, primvar interpolation).
+
+**Editing HDAs**
+- `hda_edit` / `hda_save`: unlock an asset instance (the library file is backed up first), edit inside it with the
+  normal tools, then save the definition so every instance updates. `revert_hda` throws edits away.
+
 **Cameras** (read the `houdini://camera-guide` resource first)
 - `frame_camera`: create or update a camera that frames a target by its bounding box. Front view keeps the camera
   level and shifts the lens so walls stay vertical; angle view gives a three-quarter shot. Sets the aspect ratio to
@@ -154,6 +167,8 @@ Put a `houdini_mcp_config.json` next to your `.hip`. Every key is optional:
 | `camera_insert_before` | the Karma LOP | `frame_camera` wires new camera LOPs in above this node |
 | `occluder_sops` | `[]` | SOPs `frame_camera` ray-tests for things between camera and target |
 | `front_axis` | `[0, 0, 1]` | the direction facades face (front-view cameras stand out along it) |
+| `synth_label_overrides` | `{}` | parms set for the label pass, e.g. a switch to opaque materials |
+| `synth_label_sop` | none | SOP carrying the labels, used to repair blended edge pixels |
 | `allow_reload` | `false` | enable `reload_listener` (pick up edited listener code without re-running `start_listener.py`) |
 | `auto_save` | `false` | save the `.hip` after every successful agent edit (backup first). Note this also saves any unsaved hand edits. |
 | `check_nodes` | displayed `/obj` nodes | what `cook_and_check` cooks by default |
@@ -178,7 +193,7 @@ See `examples/sf_victorian_house.json` for a full one.
 - **GUI only.** The listener runs inside an open Houdini window (it needs the main-thread event loop); no hython/headless.
 - **Tested on macOS** with Houdini 20.5.370 Apprentice. Windows/Linux should work but haven't been tried.
 - **Not covered by dedicated tools yet:** deleting/renaming nodes, ramps and multiparms, keyframing, simulations and
-  caches, exports, TOPs, COPs, KineFX, and editing HDA definitions. `run_python` (off by default) reaches all of it.
+  caches, exports, TOPs, COPs and KineFX. `run_python` (off by default) reaches all of it.
 - `set_parms` refuses to touch animated parameters unless you pass `overwrite_animation=True`.
 - Viewport text labels (`label_attrib`) are experimental and may not draw.
 

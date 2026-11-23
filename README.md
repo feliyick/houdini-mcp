@@ -174,6 +174,14 @@ See `examples/sf_victorian_house.json` for a full one.
 - There's no authentication on the socket: anything running on your machine can talk to it while it's on. Keep the
   listener off when you're not using it.
 
+## Limits (so far)
+- **GUI only.** The listener runs inside an open Houdini window (it needs the main-thread event loop); no hython/headless.
+- **Tested on macOS** with Houdini 20.5.370 Apprentice. Windows/Linux should work but haven't been tried.
+- **Not covered by dedicated tools yet:** deleting/renaming nodes, ramps and multiparms, keyframing, simulations and
+  caches, exports, TOPs, COPs, KineFX, and editing HDA definitions. `run_python` (off by default) reaches all of it.
+- `set_parms` refuses to touch animated parameters unless you pass `overwrite_animation=True`.
+- Viewport text labels (`label_attrib`) are experimental and may not draw.
+
 ## Troubleshooting
 | Symptom | Fix |
 |---|---|

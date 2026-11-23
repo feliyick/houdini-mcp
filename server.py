@@ -65,9 +65,10 @@ def cook_and_check(paths: list[str] | None = None) -> dict:
 
 # ---------------------------------------------------------------- write (backed up, one undo step each, dry_run available)
 @mcp.tool()
-def set_parms(node: str, values: dict, dry_run: bool = False) -> dict:
-    """Set parameters. A string value starting with '=' is set as an expression. Use dry_run=True to preview."""
-    return _call('set_parms', node=node, values=values, dry_run=dry_run)
+def set_parms(node: str, values: dict, dry_run: bool = False, overwrite_animation: bool = False) -> dict:
+    """Set parameters. A string value starting with '=' is set as an expression. Use dry_run=True to preview.
+    Refuses on animated (keyframed) parameters unless overwrite_animation=True, so animation is never lost by accident."""
+    return _call('set_parms', node=node, values=values, dry_run=dry_run, overwrite_animation=overwrite_animation)
 
 @mcp.tool()
 def create_node(parent: str, node_type: str, name: str | None = None, input_from: str | None = None, dry_run: bool = False) -> dict:

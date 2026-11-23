@@ -171,12 +171,15 @@ def cmd_get_parms(node, names=None, contains=None):
         if len(out) >= 400: break
     return out
 
-def cmd_set_parms(node, values, dry_run=False):
+def cmd_set_parms(node, values, dry_run=False, overwrite_animation=False):
     n = _node(node); _writable(n.path())
     changes = {}
     for nm, v in values.items():
         p = n.parm(nm) or (n.parmTuple(nm) if isinstance(v, (list, tuple)) else None)
         if p is None: raise ValueError('%s has no parm %s' % (node, nm))
+        if isinstance(p, hou.Parm) and len(p.keyframes()) > 1 and not overwrite_animation:
+            raise ValueError('%s/%s is animated (%d keyframes): setting it would delete the animation. '
+                             'Pass overwrite_animation=True to do it anyway.' % (node, nm, len(p.keyframes())))
         before = _parm_value(p) if isinstance(p, hou.Parm) else list(p.eval())
         changes[nm] = {'from': before, 'to': v}
     if dry_run:

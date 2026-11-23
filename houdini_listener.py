@@ -1018,7 +1018,8 @@ def _scene_metrics(label_sop, slope_parm=None):
             risers = [b - a for a, b in zip(levels, levels[1:])]
             top = max(h['treads'], key=lambda t: t[0])
             treads = sorted(t[2] for t in h['treads'] if t[0] != top[0])
-            e['stairs'] = {'count': len(levels), 'riser_m': round(sorted(risers)[len(risers) // 2], 3),
+            e['stairs'] = {'count': len(levels), 'risers': len(levels), 'treads': len(levels) - 1,   # levels include the landing top
+                           'riser_m': round(sorted(risers)[len(risers) // 2], 3), 'top_riser_m': round(risers[-1], 3) if risers else None,
                            'tread_m': round(treads[len(treads) // 2], 3) if treads else None,
                            'width_m': round(sorted(t[1] for t in h['treads'])[len(h['treads']) // 2], 3),
                            'tread_heights_y': levels, 'landing_y': top[0], 'landing_depth_m': round(top[2], 3)}

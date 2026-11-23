@@ -108,8 +108,8 @@ Open your scene, then in **Windows > Python Shell** run:
 ```python
 exec(open('/full/path/to/houdini-mcp/start_listener.py').read())
 ```
-Edit `HOUDINI_MCP_DIR` at the top of `start_listener.py` first if you cloned somewhere other than
-`~/HoudiniProjects/houdini-mcp`. Tip: put that line on a shelf tool. You should see:
+It finds the repo in `~/houdini-mcp` or `~/HoudiniProjects/houdini-mcp`; anywhere else, set the `HOUDINI_MCP_DIR`
+environment variable. Tip: put that line on a shelf tool. You should see:
 ```
 houdini MCP listener on 127.0.0.1:9876  config: defaults (no $HIP/houdini_mcp_config.json)
 ```

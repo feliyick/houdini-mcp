@@ -386,11 +386,16 @@ def _near_clip(eye, targets, d, bb=None, fwd=None):
     end = tgt if tgt is not None else d
     pts = sorted(x for x in occ if x < end) + [end]
     gaps = [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
-    a, b = max(gaps, key=lambda g: g[1] - g[0]) if gaps else (pts[0], end)
+    # the road: the open gap NEAREST the subject that is at least road-width (4 m); a wide gap further back
+    # (between backdrop rows) would leave the buildings across the street in view
+    widest = max((g[1] - g[0] for g in gaps), default=0.0)
+    need = min(4.0, widest * 0.5) if widest else 0.0
+    wide = [g for g in gaps if g[1] - g[0] >= need]
+    a, b = max(wide, key=lambda g: g[1]) if wide else (pts[0], end)
     if b - a < 0.4:
         return a + 0.1, ['no clear gap in front of the target (occluders up to %.1f m): clip right behind them; consider another angle' % a]
     near = (a + b) * 0.5
-    return near, ['geometry between camera and target: near clip %.1f m, mid-way through the widest open gap '
+    return near, ['geometry between camera and target: near clip %.1f m, mid-way through the open gap nearest the subject '
                   '(%.1f-%.1f m; the subject starts at %.1f m)' % (near, a, b, end)]
 
 def cmd_frame_camera(name, target, view='front', width=1280, height=720, margin=0.08, eye_height=1.6,

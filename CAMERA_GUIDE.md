@@ -8,8 +8,9 @@ Use the `frame_camera` tool. It encodes most of this. Then verify with `quick_re
 - **Re-check old cameras after scene changes.** A camera that was fine yesterday can be inside a new
   building today. A black or one-colour preview almost always means the camera is inside geometry.
 - **Clip occluders with the near plane, mid-road.** To stand far enough back for a face-on shot you may need to
-  stand inside the building opposite. `frame_camera` puts the near clip in the middle of the widest open gap between
-  camera and subject (usually the road): never right in front of the subject, where a seed with deeper bays or a
+  stand inside the building opposite. `frame_camera` puts the near clip in the middle of the open gap nearest the subject
+  that is at least road-width (4 m): the road. Not the widest gap, which can be empty space between backdrop rows
+  and leaves the buildings across the street in view: never right in front of the subject, where a seed with deeper bays or a
   bigger stoop gets sliced, and never through a tree or lamp (that leaves dark blobs).
 - **Long lenses at eye level see foreground clutter** (trees, parked cars). Raise the camera above it
   (an upstairs window: 4–8 m) rather than zooming more.
@@ -41,6 +42,6 @@ Use the `frame_camera` tool. It encodes most of this. Then verify with `quick_re
 - Check the extremes with a 2-frame, low-res Karma sweep before committing to the full render.
 
 ## Composition
-- Orbit first, compute second: the artist's favourite angles came from looking around. When Felicity finds
+- Orbit first, compute second: the artist's favourite angles came from looking around. When the artist finds
   a view she likes, save it as a camera rather than recomputing.
 - Drop shots that don't add anything over a wider one (tight close-ups rarely beat a good wide).

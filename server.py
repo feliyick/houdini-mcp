@@ -59,7 +59,7 @@ def dump_attribute(node: str, attrib: str, cls: str = 'prim', limit: int = 200) 
 
 @mcp.tool()
 def cook_and_check(paths: list[str] | None = None) -> dict:
-    """Force-cook nodes (default: hero house, street, Karma) and report every node with errors, plus slow cooks."""
+    """Force-cook nodes (default: the config's check_nodes, else every displayed /obj node) and report every node with errors, plus slow cooks."""
     return _call('cook_and_check', timeout=600, paths=paths)
 
 

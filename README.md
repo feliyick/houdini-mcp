@@ -51,6 +51,10 @@ project; its settings live in one config file (`examples/sf_victorian_house.json
   (`semantic_id`, `instance_id`, `parent_id`), rendered as Karma AOVs in a second, opaque pass. Edge pixels that Karma
   blends are repaired against the exact set of IDs on the geometry. Under an Apprentice licence the watermark corner
   is marked "ignore".
+- `scene_metrics`: measures the scene for simulation: per object group, world-space boxes (walls, door, stairs,
+  porch), ground height, step count, riser and tread size. `synth_render` also saves it per seed as `scene/seed_N.json`,
+  so a physics scene (MuJoCo, Isaac) can rebuild collision without exporting meshes. It reads the SOP named by
+  `synth_label_sop`.
 - `stage_info`: read-only look at a LOP's USD stage (prims, types, attributes, primvar interpolation).
 
 **Editing HDAs**
@@ -168,7 +172,8 @@ Put a `houdini_mcp_config.json` next to your `.hip`. Every key is optional:
 | `occluder_sops` | `[]` | SOPs `frame_camera` ray-tests for things between camera and target |
 | `front_axis` | `[0, 0, 1]` | the direction facades face (front-view cameras stand out along it) |
 | `synth_label_overrides` | `{}` | parms set for the label pass, e.g. a switch to opaque materials |
-| `synth_label_sop` | none | SOP carrying the labels, used to repair blended edge pixels |
+| `synth_label_sop` | none | SOP carrying the labels, used to repair blended edge pixels and by `scene_metrics` |
+| `synth_slope_parm` | none | optional parm whose value `scene_metrics` reports as the ground slope |
 | `allow_reload` | `false` | enable `reload_listener` (pick up edited listener code without re-running `start_listener.py`) |
 | `auto_save` | `false` | save the `.hip` after every successful agent edit (backup first). Note this also saves any unsaved hand edits. |
 | `check_nodes` | displayed `/obj` nodes | what `cook_and_check` cooks by default |

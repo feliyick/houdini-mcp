@@ -48,8 +48,9 @@ project; its settings live in one config file (`examples/sf_victorian_house.json
 - `synth_render`: for each seed and camera, renders the beauty image plus per-pixel **class** and **instance** labels
   and writes a COCO dataset (`images/`, `labels/` and `annotations.json` with boxes, run-length masks and parent links,
   e.g. a bay window inside its bay). Labels come from integer prim attributes on your geometry
-  (`semantic_id`, `instance_id`, `parent_id`), rendered as Karma AOVs in a second, opaque pass. Edge pixels that Karma
-  blends are repaired against the exact set of IDs on the geometry. Under an Apprentice licence the watermark corner
+  (`semantic_id`, `instance_id`, `parent_id`), rendered as Karma AOVs in a second, opaque pass at one sample per pixel
+  with a 1-pixel box filter, so no pixel averages two objects. Every pixel is still checked against the exact set of
+  IDs on the geometry (a safety net; it should find none). Under an Apprentice licence the watermark corner
   is marked "ignore".
 - `scene_metrics`: measures the scene for simulation: per object group, world-space boxes (walls, door, stairs,
   porch), ground height, step count, riser and tread size. `synth_render` also saves it per seed as `scene/seed_N.json`,

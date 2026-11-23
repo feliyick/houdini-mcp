@@ -389,9 +389,12 @@ def synth_render(out_dir: str, camera: str, seeds: list[int] | None = None,
                 raise RuntimeError('EXR has no %s layer (has %s)' % (nm, sorted(ch)))
             sem = np.rint(layer('semantic_id')).astype(np.int32); ins = np.rint(layer('instance_id')).astype(np.int32)
             par = np.rint(layer('parent_id')).astype(np.int32)
+            h0, w0 = sem.shape; keep = np.ones((h0, w0), bool)
+            if ignore_box:
+                keep[int(ignore_box[1] * h0):int(ignore_box[3] * h0), int(ignore_box[0] * w0):int(ignore_box[2] * w0)] = False
             repaired = 0
-            if fr.get('ids'):                                                # repair blended edge pixels
-                sem, ins, par, repaired = _repair_ids(sem, ins, fr['ids'])
+            if fr.get('ids'):                    # safety net: should find ~0 pixels now the label pass is 1 spp
+                sem, ins, par, repaired = _repair_ids(sem, ins, fr['ids'], keep)
             beauty = _exr_to_png(fr['beauty'])
             stem = '%s_%s' % (name, fr['seed'] if fr['seed'] is not None else fi)
             h, w = sem.shape
@@ -459,13 +462,13 @@ def synth_render(out_dir: str, camera: str, seeds: list[int] | None = None,
     path = os.path.join(out_dir, 'annotations.json')
     with open(path, 'w') as f: _json.dump(coco, f)
     summary = {'out_dir': out_dir, 'images': len(coco['images']), 'annotations': len(coco['annotations']),
-               'repaired_edge_pixels': repaired_total,
+               'repaired_pixels': repaired_total,
                'per_class': {}}
     for a in coco['annotations']:
         nm = SYNTH_CLASSES[a['category_id']][0]; summary['per_class'][nm] = summary['per_class'].get(nm, 0) + 1
     return [Image(data=preview, format='png'), _json.dumps(summary)]
 
-def _repair_ids(sem, ins, triples, iters=8):
+def _repair_ids(sem, ins, triples, keep=None, iters=8):
     """Pixels whose (instance, class) pair isn't on the geometry are blends of neighbours: replace each with the most
     common valid pair among its 8 neighbours (repeat to fill wider bands). Parent comes from the geometry lookup."""
     import numpy as np
@@ -473,7 +476,9 @@ def _repair_ids(sem, ins, triples, iters=8):
     valid[(0, 0)] = 0
     code = ins.astype(np.int64) * 64 + sem.clip(0, 63)
     vcodes = np.array(sorted(a * 64 + b for a, b in valid), np.int64)
-    bad = ~np.isin(code, vcodes); start = int(bad.sum())
+    bad = ~np.isin(code, vcodes)
+    if keep is not None: bad &= keep                                      # the ignore region is not counted or fixed
+    start = int(bad.sum())
     h, w = code.shape
     for _ in range(iters):
         if not bad.any(): break

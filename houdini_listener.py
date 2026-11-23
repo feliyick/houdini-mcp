@@ -982,14 +982,18 @@ def _boxes_3d(label_sop):
     return {str(k): v for k, v in bb.items()}
 
 def _scene_metrics(label_sop, slope_parm=None):
-    """Per-house numbers for robotics/simulation, measured from the labelled geometry (world space, metres, Y up):
-    stairs (count, riser, tread, width, box), landing/porch box, door box, facade + ground height."""
+    """Per-house numbers for robotics/simulation from the labelled geometry (world space, metres, Y up):
+    stairs, landing/porch box, door box, facade + ground height. Stair numbers come from prim attributes the asset
+    stamps on its stair faces (stair_risers, stair_riser_h, stair_tread, stair_climb, stair_landing_d, stair_width):
+    exact, from the node that built the stairs. Without them it falls back to measuring up-facing tread faces."""
     if not label_sop: return None
     g = _node(label_sop).geometry()
     if g is None or g.findPrimAttrib('semantic_id') is None: return None
     sem = g.primIntAttribValues('semantic_id'); ins = g.primIntAttribValues('instance_id')
     P = g.pointFloatAttribValues('P')
     houses = {}
+    SA = ('stair_risers', 'stair_steps', 'stair_riser_h', 'stair_tread', 'stair_climb', 'stair_landing_d', 'stair_width')
+    has_sa = all(g.findPrimAttrib(a) is not None for a in SA)
     def grow(b, x, y, z):
         if b is None: return [x, y, z, x, y, z]
         return [min(b[0], x), min(b[1], y), min(b[2], z), max(b[3], x), max(b[4], y), max(b[5], z)]
@@ -1002,6 +1006,8 @@ def _scene_metrics(label_sop, slope_parm=None):
         b = h[key]
         for x, y, z in zip(xs, ys, zs): b = grow(b, x, y, z)
         h[key] = b
+        if s_ == 6 and has_sa and 'exact' not in h and prim.attribValue('stair_risers') > 0:
+            h['exact'] = {a: prim.attribValue(a) for a in SA}
         if s_ == 6 and len(pts) >= 3:
             try: n = prim.normal()
             except Exception: n = None
@@ -1014,11 +1020,20 @@ def _scene_metrics(label_sop, slope_parm=None):
         e = {'walls_box': rnd(h['walls']), 'door_box': rnd(h['door']), 'stairs_box': rnd(h['stairs']), 'porch_box': rnd(h['porch'])}
         if h['walls']:
             e['ground_y'] = round(h['walls'][1], 3); e['facade_z'] = round(h['walls'][5], 3)
-        if len(levels) >= 2:
+        if h.get('exact') and h['stairs']:
+            x = h['exact']; base = h['stairs'][1]; n, rh = int(x['stair_risers']), x['stair_riser_h']
+            e['stairs'] = {'source': 'asset', 'risers': n, 'treads': int(x['stair_steps']),     # treads exclude the landing
+                           'riser_m': round(rh, 4), 'tread_m': round(x['stair_tread'], 4), 'width_m': round(x['stair_width'], 3),
+                           'climb_m': round(x['stair_climb'], 4),
+                           'tread_heights_y': [round(base + rh * k, 4) for k in range(1, n)],   # bottom step first
+                           'landing_y': round(base + x['stair_climb'], 4),                      # = door sill
+                           'landing_top_y': round(base + x['stair_climb'] + 0.01, 4),           # modelled 1 cm proud
+                           'landing_depth_m': round(x['stair_landing_d'], 3)}
+        elif len(levels) >= 2:
             risers = [b - a for a, b in zip(levels, levels[1:])]
             top = max(h['treads'], key=lambda t: t[0])
             treads = sorted(t[2] for t in h['treads'] if t[0] != top[0])
-            e['stairs'] = {'count': len(levels), 'risers': len(levels), 'treads': len(levels) - 1,   # levels include the landing top
+            e['stairs'] = {'source': 'measured', 'risers': len(levels), 'treads': len(levels) - 1,   # levels include the landing top
                            'riser_m': round(sorted(risers)[len(risers) // 2], 3), 'top_riser_m': round(risers[-1], 3) if risers else None,
                            'tread_m': round(treads[len(treads) // 2], 3) if treads else None,
                            'width_m': round(sorted(t[1] for t in h['treads'])[len(h['treads']) // 2], 3),
@@ -1041,7 +1056,8 @@ def cmd_synth_render(camera, seeds=None, seed_parm=None, width=640, height=None,
     """Synthetic data frames. Per seed, two Karma renders through `camera`:
       beauty : the scene as it is
       labels : `label_overrides` applied (parm path -> value, e.g. a switch to opaque materials: transparent glass
-               would otherwise blend IDs) and the ID primvars rendered as AOVs with a 'most coverage wins' filter.
+               would otherwise blend IDs) and the ID primvars rendered as AOVs at one sample per pixel with a
+               1-pixel box filter, so every pixel holds exactly one surface's IDs (aliased edges, no blends).
     Defaults for label_overrides come from the config key synth_label_overrides. Everything is restored."""
     karma = _karma_lop()
     cnt = karma.parm('extrarendervars')
@@ -1068,7 +1084,12 @@ def cmd_synth_render(camera, seeds=None, seed_parm=None, width=640, height=None,
                 with hou.undos.disabler(): sp.deleteAllKeyframes(); sp.set(sd)
             rb = cmd_quick_render(camera, width=width, height=height, samples=samples, look=look)
             extra = dict(overrides or {})
-            for nm, v in (('hitPz', 1), ('hitN', 1), ('enabledof', 0)):       # depth + normals, no defocus blur
+            # Exact IDs: one sample per pixel and a 1-pixel box filter, so no pixel ever averages two surfaces.
+            # (The per-AOV minmax/idcover filter alone did not stop blending in Karma CPU 20.5: 14% of label pixels
+            # came out as non-integer averages. With this setup, 0% outside the Apprentice watermark.)
+            for nm, v in (('hitPz', 1), ('hitN', 1), ('enabledof', 0),          # depth + normals, no defocus blur
+                          ('pixelfilter', 'box'), ('pixelfiltersize', 1.0), ('samplesperpixel', 1),
+                          ('varianceaa_minsamples', 1), ('varianceaa_maxsamples', 1), ('convergence_mode', 'Automatic')):
                 if karma.parm(nm) is not None: extra[karma.parm(nm).path()] = v
             set_vars(True); unset = _also_set(extra)
             try:

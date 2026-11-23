@@ -940,6 +940,100 @@ def _valid_ids(label_sop):
     par = g.primIntAttribValues('parent_id') if g.findPrimAttrib('parent_id') else [0] * len(ins)
     return sorted({(a, b, c) for a, b, c in zip(ins, sem, par)})
 
+def _camera_info(karma, camera, width, height):
+    """Intrinsics (pinhole fx, fy, cx, cy in pixels) and camera-to-world pose of a USD camera."""
+    try:
+        from pxr import Usd, UsdGeom
+        prim = karma.stage().GetPrimAtPath(camera)
+        cam = UsdGeom.Camera(prim).GetCamera(Usd.TimeCode(hou.frame()))
+        hap, vap = cam.horizontalAperture, cam.verticalAperture
+        f = cam.focalLength
+        fx = width * f / hap; fy = height * f / vap
+        cx = width * 0.5 + cam.horizontalApertureOffset / hap * width
+        cy = height * 0.5 - cam.verticalApertureOffset / vap * height
+        m = cam.transform
+        return {'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy, 'width': width, 'height': height, 'focal_mm': f,
+                'aperture_mm': [hap, vap], 'clipping': list(cam.clippingRange.min and [cam.clippingRange.min, cam.clippingRange.max] or [0, 0]),
+                'cam_to_world': [[m[r][c] for c in range(4)] for r in range(4)], 'convention': 'USD (camera looks down -Z, Y up), row-vector matrix'}
+    except Exception as e:
+        return {'error': str(e)}
+
+def _boxes_3d(label_sop):
+    """Axis-aligned 3D box per instance_id from the label geometry (world space)."""
+    if not label_sop: return {}
+    g = _node(label_sop).geometry()
+    if g is None or g.findPrimAttrib('instance_id') is None: return {}
+    ids = g.primIntAttribValues('instance_id')
+    P = g.pointFloatAttribValues('P')
+    bb = {}
+    for prim, iid in zip(g.prims(), ids):
+        if iid <= 0: continue
+        b = bb.get(iid)
+        for v in prim.vertices():
+            i = v.point().number() * 3; x, y, z = P[i], P[i + 1], P[i + 2]
+            if b is None: b = bb[iid] = [x, y, z, x, y, z]
+            else:
+                if x < b[0]: b[0] = x
+                if y < b[1]: b[1] = y
+                if z < b[2]: b[2] = z
+                if x > b[3]: b[3] = x
+                if y > b[4]: b[4] = y
+                if z > b[5]: b[5] = z
+    return {str(k): v for k, v in bb.items()}
+
+def _scene_metrics(label_sop, slope_parm=None):
+    """Per-house numbers for robotics/simulation, measured from the labelled geometry (world space, metres, Y up):
+    stairs (count, riser, tread, width, box), landing/porch box, door box, facade + ground height."""
+    if not label_sop: return None
+    g = _node(label_sop).geometry()
+    if g is None or g.findPrimAttrib('semantic_id') is None: return None
+    sem = g.primIntAttribValues('semantic_id'); ins = g.primIntAttribValues('instance_id')
+    P = g.pointFloatAttribValues('P')
+    houses = {}
+    def grow(b, x, y, z):
+        if b is None: return [x, y, z, x, y, z]
+        return [min(b[0], x), min(b[1], y), min(b[2], z), max(b[3], x), max(b[4], y), max(b[5], z)]
+    for prim, s_, i_ in zip(g.prims(), sem, ins):
+        if i_ < 1000 or s_ not in (1, 3, 6, 7): continue
+        h = houses.setdefault(i_ // 1000 - 1, {'walls': None, 'door': None, 'stairs': None, 'porch': None, 'treads': []})
+        pts = [v.point().number() * 3 for v in prim.vertices()]
+        xs = [P[k] for k in pts]; ys = [P[k + 1] for k in pts]; zs = [P[k + 2] for k in pts]
+        key = {1: 'walls', 3: 'door', 6: 'stairs', 7: 'porch'}[s_]
+        b = h[key]
+        for x, y, z in zip(xs, ys, zs): b = grow(b, x, y, z)
+        h[key] = b
+        if s_ == 6 and len(pts) >= 3:
+            try: n = prim.normal()
+            except Exception: n = None
+            if n is not None and n[1] > 0.95 and (max(xs) - min(xs)) > 0.6 and (max(ys) - min(ys)) < 0.02:
+                h['treads'].append((round(sum(ys) / len(ys), 3), max(xs) - min(xs), max(zs) - min(zs)))
+    out = {}
+    for hid, h in sorted(houses.items()):
+        levels = sorted({t[0] for t in h['treads']})
+        rnd = lambda b: [round(v, 3) for v in b] if b else None
+        e = {'walls_box': rnd(h['walls']), 'door_box': rnd(h['door']), 'stairs_box': rnd(h['stairs']), 'porch_box': rnd(h['porch'])}
+        if h['walls']:
+            e['ground_y'] = round(h['walls'][1], 3); e['facade_z'] = round(h['walls'][5], 3)
+        if len(levels) >= 2:
+            risers = [b - a for a, b in zip(levels, levels[1:])]
+            top = max(h['treads'], key=lambda t: t[0])
+            treads = sorted(t[2] for t in h['treads'] if t[0] != top[0])
+            e['stairs'] = {'count': len(levels), 'riser_m': round(sorted(risers)[len(risers) // 2], 3),
+                           'tread_m': round(treads[len(treads) // 2], 3) if treads else None,
+                           'width_m': round(sorted(t[1] for t in h['treads'])[len(h['treads']) // 2], 3),
+                           'tread_heights_y': levels, 'landing_y': top[0], 'landing_depth_m': round(top[2], 3)}
+        else:
+            e['stairs'] = None                                  # no stoop (door at street level)
+        out[str(hid)] = e
+    slope = None
+    if slope_parm and hou.parm(slope_parm): slope = hou.parm(slope_parm).eval()
+    return {'units': 'metres', 'up_axis': 'Y', 'note': 'house_id 0 = hero; boxes are [xmin, ymin, zmin, xmax, ymax, zmax]',
+            'street_slope': slope, 'houses': out}
+
+def cmd_scene_metrics(label_sop=None, slope_parm=None):
+    """Read-only: per-house stairs/door/porch/ground numbers from the label geometry (see _scene_metrics)."""
+    return _scene_metrics(label_sop or CONFIG.get('synth_label_sop'), slope_parm or CONFIG.get('synth_slope_parm'))
+
 def cmd_synth_render(camera, seeds=None, seed_parm=None, width=640, height=None, samples=24, look=None,
                      id_primvars=('semantic_id', 'instance_id', 'parent_id'), label_overrides=None, label_samples=8,
                      label_sop=None):
@@ -972,14 +1066,20 @@ def cmd_synth_render(camera, seeds=None, seed_parm=None, width=640, height=None,
             if sd is not None:
                 with hou.undos.disabler(): sp.deleteAllKeyframes(); sp.set(sd)
             rb = cmd_quick_render(camera, width=width, height=height, samples=samples, look=look)
-            set_vars(True); unset = _also_set(overrides) if overrides else None
+            extra = dict(overrides or {})
+            for nm, v in (('hitPz', 1), ('hitN', 1), ('enabledof', 0)):       # depth + normals, no defocus blur
+                if karma.parm(nm) is not None: extra[karma.parm(nm).path()] = v
+            set_vars(True); unset = _also_set(extra)
             try:
                 rl = cmd_quick_render(camera, width=width, height=height, samples=label_samples, look=look)
             finally:
                 if unset: unset()
                 set_vars(False)
+            w_, h_ = width, height or int(round(width * 9 / 16))
             out.append({'seed': sd, 'beauty': rb['exr'], 'labels': rl['exr'], 'seconds': rb['seconds'] + rl['seconds'],
-                        'ids': _valid_ids(label_sop)})
+                        'ids': _valid_ids(label_sop), 'boxes_3d': _boxes_3d(label_sop),
+                        'scene': _scene_metrics(label_sop, CONFIG.get('synth_slope_parm')),
+                        'camera': _camera_info(karma, camera, w_, h_)})
     finally:
         set_vars(False)
         if sp is not None:

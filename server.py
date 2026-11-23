@@ -137,6 +137,12 @@ def stage_info(lop: str, root: str = '/', depth: int = 3, attrs: bool = True, li
     return _call('stage_info', lop=lop, root=root, depth=depth, attrs=attrs, limit=limit, attr_filter=attr_filter)
 
 @mcp.tool()
+def scene_metrics(label_sop: str | None = None, slope_parm: str | None = None) -> dict:
+    """Read-only: per-house stairs (count, riser, tread, width), landing/porch box, door box, ground and facade height,
+    measured from the labelled geometry (defaults from the config's synth_label_sop / synth_slope_parm)."""
+    return _call('scene_metrics', label_sop=label_sop, slope_parm=slope_parm)
+
+@mcp.tool()
 def reload_listener() -> dict:
     """Reload the listener's code inside Houdini (after editing houdini_listener.py). Needs "allow_reload": true
     in the project config. Waits until the new listener answers."""
@@ -393,6 +399,16 @@ def synth_render(out_dir: str, camera: str, seeds: list[int] | None = None,
                 bx0, by0, bx1, by1 = int(ignore_box[0] * w), int(ignore_box[1] * h), int(ignore_box[2] * w), int(ignore_box[3] * h)
                 sem[by0:by1, bx0:bx1] = 255; ins[by0:by1, bx0:bx1] = 0; par[by0:by1, bx0:bx1] = 0
             open(os.path.join(out_dir, 'images', stem + '.png'), 'wb').write(beauty)
+            dkey = next((k for k in ch if k.split('.')[0] in ('depth', 'hitPz', 'Pz')), None)
+            if dkey is not None:                                             # depth: metres * 256 in uint16 (KITTI style)
+                d = ch[dkey].pixels.astype(np.float32); d = d[..., 0] if d.ndim == 3 else d
+                d = np.abs(d); d[~np.isfinite(d) | (d >= 255.99)] = 0                # sky / beyond range -> 0 = no depth
+                PILImage.fromarray(np.clip(d * 256.0, 0, 65535).astype(np.uint16)).save(os.path.join(out_dir, 'labels', stem + '_depth.png'))
+            nkeys = sorted(k for k in ch if k.split('.')[0] in ('N', 'hitN'))
+            if nkeys:
+                if len(nkeys) == 1 and ch[nkeys[0]].pixels.ndim == 3: n = ch[nkeys[0]].pixels.astype(np.float32)[..., :3]
+                else: n = np.stack([ch[k].pixels.astype(np.float32) for k in nkeys[:3]], -1)
+                PILImage.fromarray(np.clip((n * 0.5 + 0.5) * 255, 0, 255).astype(np.uint8)).save(os.path.join(out_dir, 'labels', stem + '_normal.png'))
             PILImage.fromarray(sem.clip(0, 255).astype(np.uint8)).save(os.path.join(out_dir, 'labels', stem + '_class.png'))
             vis = lut[sem.clip(0, 255)]
             PILImage.fromarray(vis).save(os.path.join(out_dir, 'labels', stem + '_class_vis.png'))
@@ -400,7 +416,14 @@ def synth_render(out_dir: str, camera: str, seeds: list[int] | None = None,
             img_id = fi + 1
             repaired_total += repaired
             coco['images'].append({'id': img_id, 'file_name': 'images/%s.png' % stem, 'width': w, 'height': h, 'seed': fr['seed'],
-                                   'ignore_box': [int(v * (w if k % 2 == 0 else h)) for k, v in enumerate(ignore_box)] if ignore_box else None})
+                                   'ignore_box': [int(v * (w if k % 2 == 0 else h)) for k, v in enumerate(ignore_box)] if ignore_box else None,
+                                   'camera': fr.get('camera'), 'look': look, 'camera_path': camera,
+                                   'depth_file': 'labels/%s_depth.png' % stem, 'depth_encoding': 'uint16 = metres * 256'})
+            boxes3d = fr.get('boxes_3d') or {}
+            if fr.get('scene'):                                              # per-seed robotics/simulation numbers
+                os.makedirs(os.path.join(out_dir, 'scene'), exist_ok=True)
+                with open(os.path.join(out_dir, 'scene', 'seed_%s.json' % fr['seed']), 'w') as sf: _json.dump(fr['scene'], sf, indent=1)
+                coco['images'][-1]['scene_file'] = 'scene/seed_%s.json' % fr['seed']
             for iid in np.unique(ins):
                 if iid <= 0: continue
                 m = ins == iid
@@ -416,6 +439,7 @@ def synth_render(out_dir: str, camera: str, seeds: list[int] | None = None,
                 if flat[0] == 1: counts = [0] + counts
                 pid = int(np.bincount(par[m].clip(0)).argmax())
                 coco['annotations'].append({'id': ann_id, 'image_id': img_id, 'category_id': cat, 'instance_id': int(iid),
+                                            'bbox_3d': boxes3d.get(str(int(iid))),
                                             'parent_instance_id': pid, 'bbox': [x0, y0, x1 - x0, y1 - y0],
                                             'area': int(m.sum()), 'iscrowd': 0,
                                             'segmentation': {'size': [h, w], 'counts': counts}})

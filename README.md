@@ -23,16 +23,6 @@ It was built for, and used on, a procedural San Francisco Victorian street:
 [sf-victorian-procedural](https://github.com/feliyick/sf-victorian-procedural) · [write-up](https://felicityyick.com/project/sf-victorian-street). Nothing in the tool depends on that
 project; its settings live in one config file (`examples/sf_victorian_house.json`).
 
-### How it compares
-Other Houdini MCP servers exist, and they're worth a look:
-[capoomgit/houdini-mcp](https://github.com/capoomgit/houdini-mcp) (open source, modelled on
-[blender-mcp](https://github.com/ahujasid/blender-mcp); general node, parameter, wrangle and render tools, plus an
-optional procedural asset library) and [DCCMCP](https://dccmcp.com/mcp-for-houdini) (commercial, in beta; TOPs, USD
-export and caches with policy limits). This one was written separately, for daily work on a production scene, so it
-leans on safety (backups, dry runs, scoped writes, undo that never touches your own edits, no arbitrary Python by
-default), on the agent checking its own work (Karma previews, viewport captures, sweep videos, camera framing), on HDA
-editing, and on getting data out (USD, caches, COCO synthetic datasets, scene measurements for simulation).
-
 ---
 
 ## What it can do

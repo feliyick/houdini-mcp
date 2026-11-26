@@ -23,6 +23,16 @@ It was built for, and used on, a procedural San Francisco Victorian street:
 [sf-victorian-procedural](https://github.com/feliyick/sf-victorian-procedural) · [write-up](https://felicityyick.com/project/sf-victorian-street). Nothing in the tool depends on that
 project; its settings live in one config file (`examples/sf_victorian_house.json`).
 
+### How it compares
+Other Houdini MCP servers exist, and they're worth a look:
+[capoomgit/houdini-mcp](https://github.com/capoomgit/houdini-mcp) (open source, modelled on
+[blender-mcp](https://github.com/ahujasid/blender-mcp); general node, parameter, wrangle and render tools, plus an
+optional procedural asset library) and [DCCMCP](https://dccmcp.com/mcp-for-houdini) (commercial, in beta; TOPs, USD
+export and caches with policy limits). This one was written separately, for daily work on a production scene, so it
+leans on safety (backups, dry runs, scoped writes, undo that never touches your own edits, no arbitrary Python by
+default), on the agent checking its own work (Karma previews, viewport captures, sweep videos, camera framing), on HDA
+editing, and on getting data out (USD, caches, COCO synthetic datasets, scene measurements for simulation).
+
 ---
 
 ## What it can do
@@ -120,7 +130,8 @@ unless you say so)
 ## Try it
 
 ### You need
-- Houdini 20.5 or newer (Apprentice / Indie / FX all work). Tested on 20.5.370 and 21.0, macOS.
+- Houdini 20.5 or newer (Apprentice / Indie / FX all work). Tested on macOS: 20.5.370 (GUI and headless) and
+  21.0.596 (headless). Several Houdini versions can be installed side by side; each gets its own package file.
 - Python **3.10+** for the server (separate from Houdini's Python). Check with `python3 --version`.
 - An MCP client. These steps use [Claude Code](https://docs.claude.com/en/docs/claude-code); any MCP client works
   (see [Other MCP clients](#other-mcp-clients)).
@@ -244,8 +255,8 @@ See `examples/sf_victorian_house.json` for a full one.
   listener off when you're not using it.
 
 ## Limits (so far)
-- **Tested on macOS** with Houdini 20.5.370 and 21.0 (Apprentice), GUI and headless. Windows/Linux should work but
-  haven't been tried.
+- **Tested on macOS** with Houdini 20.5.370 (GUI and headless) and 21.0.596 (headless), Apprentice. The 21.0 GUI,
+  Windows and Linux should work but haven't been tried. Older than 20.5 is not supported.
 - **Headless serves one client at a time** and has no viewport.
 - **Not covered by dedicated tools yet:** deleting/renaming nodes, ramps and multiparms, keyframing, running
   simulations, TOPs/PDG, COPs and KineFX. `run_python` (off by default) reaches all of it.

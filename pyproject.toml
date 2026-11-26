@@ -36,4 +36,4 @@ houdini-mcp-headless = "houdini_mcp.install:headless_main"
 packages = ["houdini_mcp"]
 
 [tool.setuptools.package-data]
-houdini_mcp = ["CAMERA_GUIDE.md", "houdini_pkg/python3.11libs/*.py"]
+houdini_mcp = ["CAMERA_GUIDE.md", "houdini_pkg/python3.*libs/*.py"]
